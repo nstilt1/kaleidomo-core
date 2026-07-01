@@ -1,0 +1,90 @@
+[package]
+name = "kaleidomo-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow  = "1.0.102"
+bytemuck = "1.25.0"
+log     = "0.4.29"
+pollster = "0.4.0"
+
+# image: no default features; each target opts in to only what it needs
+image = { version = "0.24.0", default-features = false }
+
+# wgpu: shared features only; backends are added per-target below
+wgpu = { version = "29", default-features = false, features = ["std", "wgsl"] }
+
+# ── Native (non-Wasm) ────────────────────────────────────────────────────────
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon    = "1.10"
+minimp4  = "0.1.2"
+openh264 = "0.9.3"
+serde   = { version = "1.0.228", features = ["derive"] }
+software_licensor_static_rust_lib = { git = "https://github.com/nstilt1/software-licensor-client-side-library", package = "software_licensor_static_rust_lib", features = ["rlib", "serde", "logging"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.wgpu]
+version = "29"
+default-features = false
+features = ["std", "wgsl", "dx12", "gles", "metal", "vulkan"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.image]
+version = "0.24.0"
+default-features = false
+features = ["png", "jpeg"]
+
+# ── Wasm ─────────────────────────────────────────────────────────────────────
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen         = "=0.2.108"
+wasm-bindgen-futures = "0.4"
+js-sys               = "0.3"
+# Routes log::error! / log::warn! etc. to the browser console
+wasm-logger          = "0.2"
+# Turns Rust panics into readable browser console errors
+console_error_panic_hook = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.image]
+version = "0.24.0"
+default-features = false
+# Pure-Rust decoders — no native libs needed in Wasm
+features = ["png", "jpeg", "webp"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.wgpu]
+version = "29"
+default-features = false
+# Default Wasm build is WebGPU-only. This prevents macOS Tauri/WKWebView from
+# silently falling back to WebGL/GL, which cannot support Kaleidomo's compute
+# pipeline/storage textures.
+features = ["std", "wgsl", "webgpu"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+    "HtmlCanvasElement",
+    "Window",
+    "Document",
+    "Element",
+    # WebGPU types (requires --cfg=web_sys_unstable_apis at build time)
+    "Gpu",
+    "GpuAdapter",
+    "GpuDevice",
+    # fetch API — used by load_image_from_url
+    "Request",
+    "RequestInit",
+    "Response",
+]
+
+[features]
+default = []
+soft_backend = []
+dev = []
+# Optional compile-only feature for other future Wasm entry points that do not use
+# the live compute/storage-texture renderer. The live engine itself always requests
+# BROWSER_WEBGPU only, so this feature cannot make it silently run on GL.
+wasm_webgl_fallback = ["wgpu/webgl", "wgpu/gles"]
+
+# Required by wasm-pack / Trunk to emit both a .wasm and a native rlib
+[lib]
+crate-type = ["cdylib", "rlib"]
