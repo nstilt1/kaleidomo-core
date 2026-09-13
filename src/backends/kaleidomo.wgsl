@@ -30,6 +30,14 @@ struct KaleidoSettings {
     source_tile_grid_height: u32,
     output_tile_origin_x: u32,
     output_tile_origin_y: u32,
+
+    // ── Enhancements (see `KaleidoSettings` in lib.rs for full docs) ──
+    // `anti_alias`/`aspect_correct` are u32 (0/1) rather than bool for WGSL
+    // uniform-buffer layout compatibility with `GpuKaleidoSettings` in gpu.rs.
+    anti_alias: u32,
+    aspect_correct: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0)
@@ -68,6 +76,26 @@ fn load_source_pixel(src_i: vec2<i32>) -> vec4<f32> {
     let layer = i32(tile_y * settings.source_tile_grid_width + tile_x);
 
     return textureLoad(input_tex, vec2<i32>(local_x, local_y), layer, 0);
+}
+
+// `anti_alias` path: bilinear-blends the four nearest texels around floating
+// point source coordinates `(sx, sy)` instead of rounding to the nearest one.
+// Mirrors the CPU backends' shared `bilinear_sample` helper in backends/mod.rs
+// so the two render paths produce visually consistent smoothing.
+fn load_source_pixel_bilinear(sx: f32, sy: f32) -> vec4<f32> {
+    let x0 = floor(sx);
+    let y0 = floor(sy);
+    let fx = sx - x0;
+    let fy = sy - y0;
+
+    let p00 = load_source_pixel(vec2<i32>(i32(x0), i32(y0)));
+    let p10 = load_source_pixel(vec2<i32>(i32(x0) + 1, i32(y0)));
+    let p01 = load_source_pixel(vec2<i32>(i32(x0), i32(y0) + 1));
+    let p11 = load_source_pixel(vec2<i32>(i32(x0) + 1, i32(y0) + 1));
+
+    let top = mix(p00, p10, fx);
+    let bottom = mix(p01, p11, fx);
+    return mix(top, bottom, fy);
 }
 
 fn euclidean_modulo(a : f32, b : f32) -> f32 {
@@ -329,73 +357,17 @@ fn source_in_bounds(src_i: vec2<i32>) -> bool {
         src_i.y < i32(settings.source_height);
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let local_x = gid.x;
-    let local_y = gid.y;
-
-    let out_dims = textureDimensions(output_tex);
-    if (local_x >= out_dims.x || local_y >= out_dims.y) {
-        return;
-    }
-
-    let x = settings.output_tile_origin_x + local_x;
-    let y = settings.output_tile_origin_y + local_y;
-
-    if (x >= settings.output_size_w || y >= settings.output_size_h) {
-        return;
-    }
-
-    let center_x = f32(settings.output_size_w) * 0.5 + f32(settings.offset_x);
-    let center_y = f32(settings.output_size_h) * 0.5 + f32(settings.offset_y);
-
-    let width_over_2 = f32(settings.output_size_w) * 0.5;
-
-    let dx = f32(x) - center_x;
-    let dy = f32(y) - center_y;
-
-    var mapped = vec2<f32>(dx, dy);
-
-    switch settings.kaleido_type {
-        case 0u: {
-            mapped = map_radial(dx, dy, settings.zoom, settings.slice_angle, settings.triangle_rotation_rad);
-        }
-        case 1u: {
-            mapped = map_square(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
-        }
-        case 2u: {
-            mapped = map_diamond(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
-        }
-        case 3u: {
-            mapped = map_hexagonal(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
-        }
-        case 4u: {
-            mapped = map_hexagonal_flat_top(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
-        }
-        default: {
-            mapped = vec2<f32>(dx, dy);
-        }
-    }
-
-    let src_x = round(mapped.x);
-    let src_y = round(mapped.y);
-    let src_i = vec2<i32>(i32(src_x), i32(src_y));
-
-    if (!source_in_bounds(src_i)) {
-        textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
-        return;
-    }
-
-    let color = load_source_pixel(src_i);
-
-    // daydream
-    // rgb to hsv conversion for hue rotation
-    var final_rgb = color.rgb;
+// Applies the configured hue rotation (in degrees) to an RGB color via an
+// RGB→HSV→RGB round trip. Factored out of `main()` so both the nearest-neighbor
+// and `anti_alias` (bilinear) sampling paths share the same hue-rotation code
+// instead of duplicating it.
+fn apply_hue_rotation(rgb: vec3<f32>) -> vec3<f32> {
+    var final_rgb = rgb;
 
     if (settings.hue_rotation % 360 != 0u) {
-        let r = color.r;
-        let g = color.g;
-        let b = color.b;
+        let r = rgb.r;
+        let g = rgb.g;
+        let b = rgb.b;
 
         let c_max = max(r, max(g, b));
         let c_min = min(r, min(g, b));
@@ -458,6 +430,102 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         final_rgb = vec3<f32>(rp + m, gp + m, bp + m);
     }
+
+    return final_rgb;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let local_x = gid.x;
+    let local_y = gid.y;
+
+    let out_dims = textureDimensions(output_tex);
+    if (local_x >= out_dims.x || local_y >= out_dims.y) {
+        return;
+    }
+
+    let x = settings.output_tile_origin_x + local_x;
+    let y = settings.output_tile_origin_y + local_y;
+
+    if (x >= settings.output_size_w || y >= settings.output_size_h) {
+        return;
+    }
+
+    let center_x = f32(settings.output_size_w) * 0.5 + f32(settings.offset_x);
+    let center_y = f32(settings.output_size_h) * 0.5 + f32(settings.offset_y);
+
+    let width_over_2 = f32(settings.output_size_w) * 0.5;
+
+    let dx = f32(x) - center_x;
+    var dy = f32(y) - center_y;
+
+    // `aspect_correct`: scale dy by the canvas's width/height ratio before the
+    // angle/radius is computed, mirroring the CPU backends' shared `inner_loop`
+    // (backends/mod.rs) so the two render paths look identical. Disabled by
+    // default, so output for existing presets is unchanged.
+    if (settings.aspect_correct != 0u) {
+        let aspect_ratio = f32(settings.output_size_w) / max(f32(settings.output_size_h), 1.0);
+        dy = dy * aspect_ratio;
+    }
+
+    var mapped = vec2<f32>(dx, dy);
+
+    switch settings.kaleido_type {
+        case 0u: {
+            mapped = map_radial(dx, dy, settings.zoom, settings.slice_angle, settings.triangle_rotation_rad);
+        }
+        case 1u: {
+            mapped = map_square(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
+        }
+        case 2u: {
+            mapped = map_diamond(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
+        }
+        case 3u: {
+            mapped = map_hexagonal(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
+        }
+        case 4u: {
+            mapped = map_hexagonal_flat_top(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
+        }
+        default: {
+            mapped = vec2<f32>(dx, dy);
+        }
+    }
+
+    let src_x = round(mapped.x);
+    let src_y = round(mapped.y);
+    let src_i = vec2<i32>(i32(src_x), i32(src_y));
+
+    // `anti_alias`: bilinear-blend the four nearest texels instead of rounding
+    // to the nearest one. Uses a 1px-tolerant bounds check (mirroring the CPU
+    // backends' `bilinear_sample`) since the blend itself clamps to the image
+    // edge, so texels just outside the strict integer bounds are still valid.
+    if (settings.anti_alias != 0u) {
+        let in_bounds_bilinear = mapped.x >= -1.0 && mapped.x < f32(settings.source_width) + 1.0
+            && mapped.y >= -1.0 && mapped.y < f32(settings.source_height) + 1.0;
+        if (!in_bounds_bilinear) {
+            textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+            return;
+        }
+
+        let clamped_x = clamp(mapped.x, 0.0, f32(settings.source_width) - 1.0);
+        let clamped_y = clamp(mapped.y, 0.0, f32(settings.source_height) - 1.0);
+        let color = load_source_pixel_bilinear(clamped_x, clamped_y);
+        let final_rgb = apply_hue_rotation(color.rgb);
+        textureStore(
+            output_tex,
+            vec2<i32>(i32(local_x), i32(local_y)),
+            vec4<f32>(final_rgb, color.a),
+        );
+        return;
+    }
+
+    if (!source_in_bounds(src_i)) {
+        textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    let color = load_source_pixel(src_i);
+    let final_rgb = apply_hue_rotation(color.rgb);
 
     textureStore(
         output_tex,

@@ -1,6 +1,118 @@
-use image::DynamicImage;
+// kaleidomo-core/src/backends/mod.rs
+use image::{DynamicImage, GenericImageView};
 
 use crate::{KaleidoSettings, KaleidoType};
+
+/// Bilinear-samples `source` at floating point coordinates `(sx, sy)`, blending
+/// the four nearest texels. Coordinates are clamped to the image bounds so
+/// sampling near the edges never goes out of range. Shared by every CPU
+/// backend's `anti_alias` path (scalar/SSE2/AVX2/NEON all delegate here for
+/// the actual pixel math, since gathering from an `image::DynamicImage` isn't
+/// itself vectorizable) so the smoothing looks identical across backends.
+#[inline]
+pub(crate) fn bilinear_sample(source: &DynamicImage, sx: f32, sy: f32, sw: u32, sh: u32) -> [u8; 4] {
+    if sw == 0 || sh == 0 {
+        return [0, 0, 0, 0];
+    }
+    let sx = sx.clamp(0.0, (sw - 1) as f32);
+    let sy = sy.clamp(0.0, (sh - 1) as f32);
+    let x0 = sx.floor() as u32;
+    let y0 = sy.floor() as u32;
+    let x1 = (x0 + 1).min(sw - 1);
+    let y1 = (y0 + 1).min(sh - 1);
+    let fx = sx - x0 as f32;
+    let fy = sy - y0 as f32;
+
+    let p00 = source.get_pixel(x0, y0).0;
+    let p10 = source.get_pixel(x1, y0).0;
+    let p01 = source.get_pixel(x0, y1).0;
+    let p11 = source.get_pixel(x1, y1).0;
+
+    let mut out = [0u8; 4];
+    for c in 0..4 {
+        let top = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
+        let bottom = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
+        out[c] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+/// Same as [`bilinear_sample`], but also applies an HSV hue rotation to the
+/// blended pixel. Used by the `anti_alias` path when `hue_rotation != 0`; the
+/// fast SIMD/integer hue-shift path (`store_pixel_hue_shift`) is used when
+/// `anti_alias` is disabled, since it doesn't need per-pixel scalar blending.
+#[inline]
+pub(crate) fn bilinear_sample_hue_shift(
+    source: &DynamicImage,
+    sx: f32,
+    sy: f32,
+    sw: u32,
+    sh: u32,
+    hue_shift_degrees: f32,
+) -> [u8; 4] {
+    let [r, g, b, a] = bilinear_sample(source, sx, sy, sw, sh);
+    if hue_shift_degrees == 0.0 {
+        return [r, g, b, a];
+    }
+    let (h, s, v) = rgb_to_hsv_scalar(r, g, b);
+    let h = (h + hue_shift_degrees).rem_euclid(360.0);
+    let (r2, g2, b2) = hsv_to_rgb_scalar(h, s, v);
+    [r2, g2, b2, a]
+}
+
+/// Plain-scalar RGB→HSV conversion (0-255 RGB in, degrees/0-1/0-1 HSV out).
+/// Kept separate from each backend's SIMD hue-rotation intrinsics so the
+/// `anti_alias` blending path doesn't need to touch per-backend register code.
+#[inline]
+fn rgb_to_hsv_scalar(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let c_max = r.max(g).max(b);
+    let c_min = r.min(g).min(b);
+    let delta = c_max - c_min;
+
+    let h = if delta == 0.0 {
+        0.0
+    } else if c_max == r {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if c_max == g {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+
+    let s = if c_max == 0.0 { 0.0 } else { delta / c_max };
+    let v = c_max;
+    (h, s, v)
+}
+
+/// Plain-scalar HSV→RGB conversion, inverse of [`rgb_to_hsv_scalar`].
+#[inline]
+fn hsv_to_rgb_scalar(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let h_sector = h / 60.0;
+    let x = c * (1.0 - (h_sector.rem_euclid(2.0) - 1.0).abs());
+    let m = v - c;
+
+    let (rp, gp, bp) = if h_sector < 1.0 {
+        (c, x, 0.0)
+    } else if h_sector < 2.0 {
+        (x, c, 0.0)
+    } else if h_sector < 3.0 {
+        (0.0, c, x)
+    } else if h_sector < 4.0 {
+        (0.0, x, c)
+    } else if h_sector < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+
+    (
+        ((rp + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((gp + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((bp + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
 
 #[cfg(any(all(test, target_arch = "aarch64"), target_arch = "aarch64"))]
 mod neon;
@@ -47,6 +159,11 @@ pub trait KaleidoBackend: Sized + Copy {
     unsafe fn load_coords(x: u32, y: u32) -> (Self, Self);
     /// Normalizes coordinates relative to the center.
     unsafe fn normalize_coords(&mut self, center: Self);
+    /// Multiplies every lane by `factor`. Used for `aspect_correct`: scaling
+    /// the vertical (dy) axis by the output canvas's width/height ratio
+    /// before the angle/radius is computed, so the kaleidoscope pattern isn't
+    /// visually stretched into an ellipse on non-square canvases.
+    unsafe fn scale(self, factor: Self) -> Self;
     /// Performs the four quadrant arctangent of self (y) and other (x) in radians.
     unsafe fn atan2_k(&self, other: Self) -> Self;
     /// Maps the coordinates to polar coordinates, returning a register of (r, theta).
@@ -61,6 +178,8 @@ pub trait KaleidoBackend: Sized + Copy {
         triangle_center_y: Self,
     ) -> (Self, Self);
     /// Stores pixels into the output buffer from the source image, given the computed source coordinates.
+    /// When `bilinear` is `true` (the `anti_alias` setting), samples are blended between the four
+    /// nearest source texels instead of rounding to the nearest one.
     unsafe fn store_pixel(
         output: &mut [u8],
         x: u32,
@@ -69,6 +188,7 @@ pub trait KaleidoBackend: Sized + Copy {
         source: &DynamicImage,
         sw: u32,
         sh: u32,
+        bilinear: bool,
     );
 
     /// Folds the coordinates for square kaleidoscope.
@@ -213,7 +333,10 @@ pub trait DaydreamBackend: KaleidoBackend {
     ) -> [[u8; 4]; Self::NUM_FLOATS];
 
     /// Stores a pixel in the output buffer, applying a hue shift to the source pixel before sampling.
-    unsafe fn store_pixel_hue_shift(buff: &mut [u8], x: u32, sx: Self, sy: Self, source: &DynamicImage, source_width: u32, source_height: u32, hue_shift_vec: Self, two_fifty_five: Self, hundred: Self, zero: Self, six: Self, sixty: Self, one: Self, two: Self, four: Self, three_sixty: Self, five: Self, three: Self);
+    /// When `bilinear` is `true` (the `anti_alias` setting), the source sample is blended between the
+    /// four nearest texels (via the shared scalar `bilinear_sample_hue_shift` helper) before the hue
+    /// shift is applied, instead of using the fast SIMD nearest-neighbor + hue-shift path.
+    unsafe fn store_pixel_hue_shift(buff: &mut [u8], x: u32, sx: Self, sy: Self, source: &DynamicImage, source_width: u32, source_height: u32, hue_shift_vec: Self, two_fifty_five: Self, hundred: Self, zero: Self, six: Self, sixty: Self, one: Self, two: Self, four: Self, three_sixty: Self, five: Self, three: Self, bilinear: bool);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -264,6 +387,16 @@ pub fn inner_loop<B: KaleidoBackend + DaydreamBackend>(
         let three_sixty = B::load_with_single_f32(360.0);
         let five = B::load_with_single_f32(5.0);
 
+        // `aspect_correct`: scale dy by the canvas's width/height ratio before the
+        // angle/radius is computed, so the mirrored wedges stay proportional
+        // instead of stretching into an ellipse on non-square canvases. Disabled
+        // by default (see `KaleidoSettings::aspect_correct`), so behavior for
+        // existing presets/output is unchanged unless explicitly turned on.
+        let aspect_ratio = B::load_with_single_f32(
+            settings.output_size_w as f32 / settings.output_size_h.max(1) as f32,
+        );
+        let anti_alias = settings.anti_alias;
+
         row.chunks_exact_mut(B::NUM_FLOATS * size_of::<f32>())
             .enumerate()
             .for_each(|(x, buff)| {
@@ -271,6 +404,9 @@ pub fn inner_loop<B: KaleidoBackend + DaydreamBackend>(
                 let (mut dx, mut dy) = B::load_coords(x as u32, y as u32);
                 dx.normalize_coords(center_x);
                 dy.normalize_coords(center_y);
+                if settings.aspect_correct {
+                    dy = dy.scale(aspect_ratio);
+                }
                 let (sx, sy) = match settings.kaleido_type {
                     KaleidoType::Radial => {
                         let (r_sampled, theta) = B::map_to_polar(dx, dy, zoom);
@@ -337,9 +473,9 @@ pub fn inner_loop<B: KaleidoBackend + DaydreamBackend>(
 
                 //B::store_pixel_rgba8(buff, sx, sy, source.as_bytes(), source_width, source_height);
                 if hue_shift != 0 {
-                    B::store_pixel_hue_shift(buff, x, sx, sy, source, source_width, source_height, hue_shift_vec, two_fifty_five, hundred, zero, six, sixty, one, two, four, three_sixty, five, three);
+                    B::store_pixel_hue_shift(buff, x, sx, sy, source, source_width, source_height, hue_shift_vec, two_fifty_five, hundred, zero, six, sixty, one, two, four, three_sixty, five, three, anti_alias);
                 } else {
-                    B::store_pixel(buff, x, sx, sy, source, source_width, source_height);
+                    B::store_pixel(buff, x, sx, sy, source, source_width, source_height, anti_alias);
                 }
             });
         }

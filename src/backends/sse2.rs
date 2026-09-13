@@ -1,3 +1,4 @@
+// kaleidomo-core/src/backends/sse2.rs
 #[cfg(target_arch = "x86")]
 pub use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
@@ -6,6 +7,7 @@ pub use core::arch::x86_64::*;
 use image::GenericImageView;
 
 use crate::{DaydreamBackend, image::DynamicImage, KaleidoBackend};
+use crate::backends::{bilinear_sample, bilinear_sample_hue_shift};
 #[target_feature(enable = "sse2")]
 #[inline]
 unsafe fn atan(x: __m128) -> __m128 {
@@ -159,6 +161,11 @@ impl KaleidoBackend for __m128 {
     }
     #[target_feature(enable = "sse2")]
     #[inline]
+    unsafe fn scale(self, factor: Self) -> Self {
+        unsafe { _mm_mul_ps(self, factor) }
+    }
+    #[target_feature(enable = "sse2")]
+    #[inline]
     unsafe fn atan2_k(&self, other: Self) -> Self {
         unsafe {
             let pi = _mm_set1_ps(core::f32::consts::PI);
@@ -269,6 +276,7 @@ impl KaleidoBackend for __m128 {
         source: &DynamicImage,
         sw: u32,
         sh: u32,
+        bilinear: bool,
     ) {
         unsafe {
             let zero = _mm_set1_ps(0.0);
@@ -287,6 +295,29 @@ impl KaleidoBackend for __m128 {
             );
 
             let lane_mask = _mm_movemask_ps(v_mask) as u32;
+
+            if bilinear {
+                // anti_alias path: bilinear filtering isn't vectorizable across lanes
+                // (each lane gathers from a different, data-dependent texel), so we
+                // extract the raw (unrounded) per-lane floats and blend each pixel
+                // via the shared scalar `bilinear_sample` helper.
+                let mut raw_x = [0.0f32; Self::NUM_FLOATS];
+                let mut raw_y = [0.0f32; Self::NUM_FLOATS];
+                _mm_storeu_ps(raw_x.as_mut_ptr(), sx);
+                _mm_storeu_ps(raw_y.as_mut_ptr(), sy);
+
+                for i in 0..Self::NUM_FLOATS {
+                    if ((lane_mask >> i) & 1) != 0
+                        || (raw_x[i] >= -1.0 && raw_x[i] < sw as f32 + 1.0
+                            && raw_y[i] >= -1.0 && raw_y[i] < sh as f32 + 1.0)
+                    {
+                        let offset = i * 4;
+                        let pixel = bilinear_sample(source, raw_x[i], raw_y[i], sw, sh);
+                        output[offset..offset + 4].copy_from_slice(&pixel);
+                    }
+                }
+                return;
+            }
 
             let max_x = _mm_set1_ps(sw.saturating_sub(1) as f32);
             let max_y = _mm_set1_ps(sh.saturating_sub(1) as f32);
@@ -906,10 +937,35 @@ impl DaydreamBackend for __m128 {
         three_sixty: Self,
         five: Self,
         three: Self,
+        bilinear: bool,
     ) {
         use std::arch::x86_64::*;
 
         unsafe {
+            if bilinear {
+                // anti_alias path: same rationale as `store_pixel` — gather + blend
+                // per lane via the shared scalar helper instead of the fast SIMD
+                // nearest + integer-hue-rotation path below.
+                let mut raw_x = [0.0f32; Self::NUM_FLOATS];
+                let mut raw_y = [0.0f32; Self::NUM_FLOATS];
+                _mm_storeu_ps(raw_x.as_mut_ptr(), sx);
+                _mm_storeu_ps(raw_y.as_mut_ptr(), sy);
+                let hue_shift_degrees = _mm_cvtss_f32(hue_shift_vec);
+
+                for i in 0..Self::NUM_FLOATS {
+                    if raw_x[i] >= -1.0 && raw_x[i] < source_width as f32 + 1.0
+                        && raw_y[i] >= -1.0 && raw_y[i] < source_height as f32 + 1.0
+                    {
+                        let offset = i * 4;
+                        let pixel = bilinear_sample_hue_shift(
+                            source, raw_x[i], raw_y[i], source_width, source_height, hue_shift_degrees,
+                        );
+                        buff[offset..offset + 4].copy_from_slice(&pixel);
+                    }
+                }
+                return;
+            }
+
             let zero_f = _mm_set1_ps(0.0);
             let sw_v = _mm_set1_ps(source_width as f32);
             let sh_v = _mm_set1_ps(source_height as f32);

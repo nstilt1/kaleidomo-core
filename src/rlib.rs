@@ -1,3 +1,4 @@
+// kaleidomo-core/src/rlib.rs
 pub use anyhow;
 pub use log;
 #[allow(unused)]
@@ -122,6 +123,36 @@ pub fn render_kaleidoscope_with_backend<B: KaleidoBackend + DaydreamBackend>(
     source: &DynamicImage,
     settings: KaleidoSettings,
 ) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+    let factor = settings.super_sample.clamp(1, 4);
+    if factor > 1 {
+        // `super_sample` path: render at `output_size * factor` internally using the
+        // exact same per-backend math (nothing below needs to know about
+        // supersampling), then box-downsample back to the requested output size.
+        // This is intentionally backend-agnostic — it works uniformly whichever
+        // CPU backend `B` is, since it only wraps the output buffer dimensions.
+        let (out_w, out_h) = (settings.output_size_w, settings.output_size_h);
+        let big_settings = KaleidoSettings {
+            output_size_w: out_w * factor as u32,
+            output_size_h: out_h * factor as u32,
+            offset_x: settings.offset_x * factor as i32,
+            offset_y: settings.offset_y * factor as i32,
+            ..settings.clone()
+        };
+        let big = render_kaleidoscope_with_backend_inner::<B>(source, &big_settings);
+        let downsampled = downsample_box(big.as_raw(), big_settings.output_size_w, big_settings.output_size_h, factor, out_w, out_h);
+        return ImageBuffer::from_raw(out_w, out_h, downsampled).unwrap();
+    }
+
+    render_kaleidoscope_with_backend_inner::<B>(source, &settings)
+}
+
+/// The actual native-resolution render, shared by both the direct (`super_sample == 1`)
+/// path and the supersampling wrapper in [`render_kaleidoscope_with_backend`] above.
+#[inline(always)]
+fn render_kaleidoscope_with_backend_inner<B: KaleidoBackend + DaydreamBackend>(
+    source: &DynamicImage,
+    settings: &KaleidoSettings,
+) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
     let (sw, sh) = source.dimensions();
     let width_over_2 = settings.output_size_w as f32 / 2.0;
     let center_x = settings.output_size_w as f32 / 2.0 + settings.offset_x as f32;
@@ -142,7 +173,7 @@ pub fn render_kaleidoscope_with_backend<B: KaleidoBackend + DaydreamBackend>(
                 row,
                 settings.zoom,
                 source,
-                &settings,
+                settings,
                 width_over_2,
                 center_x,
                 center_y,
@@ -156,29 +187,89 @@ pub fn render_kaleidoscope_with_backend<B: KaleidoBackend + DaydreamBackend>(
     ImageBuffer::from_raw(settings.output_size_w, settings.output_size_h, pixels).unwrap()
 }
 
+/// Box-downsamples an RGBA8 buffer of size `(src_w, src_h)` by an integer `factor`
+/// down to `(dst_w, dst_h)` (where `src_w == dst_w * factor` and `src_h == dst_h *
+/// factor`), averaging each `factor x factor` block of source pixels into one
+/// destination pixel (alpha-weighted, so fully transparent supersample pixels
+/// don't darken partially-covered edges). Shared by every backend's
+/// `super_sample` path — CPU and GPU alike — so the smoothing looks identical
+/// regardless of which backend rendered the oversized frame.
+pub fn downsample_box(src: &[u8], src_w: u32, src_h: u32, factor: u8, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    let factor = factor as u32;
+    let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
+    let samples = (factor * factor) as f32;
+
+    out.par_chunks_exact_mut((dst_w * 4) as usize)
+        .enumerate()
+        .for_each(|(dy, out_row)| {
+            for dx in 0..dst_w {
+                let mut sum = [0.0f32; 4];
+                for sy in 0..factor {
+                    let src_y = dy as u32 * factor + sy;
+                    let row_start = (src_y * src_w * 4) as usize;
+                    for sx in 0..factor {
+                        let src_x = dx * factor + sx;
+                        let idx = row_start + (src_x * 4) as usize;
+                        sum[0] += src[idx] as f32;
+                        sum[1] += src[idx + 1] as f32;
+                        sum[2] += src[idx + 2] as f32;
+                        sum[3] += src[idx + 3] as f32;
+                    }
+                }
+                let out_idx = (dx * 4) as usize;
+                out_row[out_idx] = (sum[0] / samples).round().clamp(0.0, 255.0) as u8;
+                out_row[out_idx + 1] = (sum[1] / samples).round().clamp(0.0, 255.0) as u8;
+                out_row[out_idx + 2] = (sum[2] / samples).round().clamp(0.0, 255.0) as u8;
+                out_row[out_idx + 3] = (sum[3] / samples).round().clamp(0.0, 255.0) as u8;
+            }
+        });
+
+    out
+}
+
 #[cfg(test)]
 pub fn render_kaleidoscope_with_gpu(
     source: &DynamicImage,
     settings: KaleidoSettings,
 ) -> anyhow::Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
-    let rgba = source.to_rgba8();
+    let factor = settings.super_sample.clamp(1, 4);
+    let (out_w, out_h) = (settings.output_size_w, settings.output_size_h);
+    // `super_sample`: render at `output_size * factor` on the GPU, same as the CPU
+    // backends' wrapper, then box-downsample back down to the requested size.
+    let render_settings = if factor > 1 {
+        KaleidoSettings {
+            output_size_w: out_w * factor as u32,
+            output_size_h: out_h * factor as u32,
+            offset_x: settings.offset_x * factor as i32,
+            offset_y: settings.offset_y * factor as i32,
+            ..settings.clone()
+        }
+    } else {
+        settings.clone()
+    };
 
     let mut gpu = pollster::block_on(GpuBackend::new())
         .context("failed to initialize GPU backend")?;
     gpu.set_source_image(source)?;
-    gpu.update_settings(&settings)?;
+    gpu.update_settings(&render_settings)?;
     let mut pixels = vec![
         0u8;
-        (settings.output_size_w as usize)
-            .checked_mul(settings.output_size_h as usize)
+        (render_settings.output_size_w as usize)
+            .checked_mul(render_settings.output_size_h as usize)
             .and_then(|v| v.checked_mul(4))
             .context("output dimensions overflowed")?
     ];
 
-    gpu.render_into_buffer(&settings, &mut pixels)
+    gpu.render_into_buffer(&render_settings, &mut pixels)
         .context("failed to render kaleidoscope on GPU")?;
 
-    ImageBuffer::from_raw(settings.output_size_w, settings.output_size_h, pixels)
+    if factor > 1 {
+        let downsampled = downsample_box(&pixels, render_settings.output_size_w, render_settings.output_size_h, factor, out_w, out_h);
+        return ImageBuffer::from_raw(out_w, out_h, downsampled)
+            .context("GPU returned an invalid output buffer length");
+    }
+
+    ImageBuffer::from_raw(out_w, out_h, pixels)
         .context("GPU returned an invalid output buffer length")
 }
 
@@ -519,22 +610,35 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fps = video_settings.fps;
     let total_frames = f32::round(video_settings.animation_duration * fps as f32) as u32;
-    let width_over_2 = settings.output_size_w as f32 / 2.0;
-    let center_x = settings.output_size_w as f32 / 2.0 + settings.offset_x as f32;
-    let center_y = settings.output_size_h as f32 / 2.0 + settings.offset_y as f32;
+
+    // `super_sample`: render each frame into a `factor`x-larger scratch buffer and
+    // box-downsample it down to the final output size before it's handed to the
+    // H.264 encoder. `width_over_2`/`center_x`/`center_y` are computed against the
+    // *scaled* dimensions so `inner_loop` draws the (larger) frame correctly; the
+    // final encoded video is still exactly `output_size_w x output_size_h`.
+    let factor = settings.super_sample.clamp(1, 4);
+    let (out_w, out_h) = (settings.output_size_w, settings.output_size_h);
+    let (render_w, render_h) = (out_w * factor as u32, out_h * factor as u32);
+    let render_offset_x = settings.offset_x * factor as i32;
+    let render_offset_y = settings.offset_y * factor as i32;
+
+    let width_over_2 = render_w as f32 / 2.0;
+    let center_x = render_w as f32 / 2.0 + render_offset_x as f32;
+    let center_y = render_h as f32 / 2.0 + render_offset_y as f32;
     let slice_angle = (2.0 * PI) / settings.count as f32;
 
-    let mut rgba = vec![0u8; (settings.output_size_w * settings.output_size_h * 4) as usize];
+    let mut rgba = vec![0u8; (render_w * render_h * 4) as usize];
+    let mut final_rgba = vec![0u8; (out_w * out_h * 4) as usize];
     let mut sink = Mp4H264Sink::create(
         path,
-        settings.output_size_w as usize,
-        settings.output_size_h as usize,
+        out_w as usize,
+        out_h as usize,
         fps,
-        (settings.output_size_w as f32 * settings.output_size_h as f32 * fps as f32 * video_settings.quality).round() as u32,
+        (out_w as f32 * out_h as f32 * fps as f32 * video_settings.quality).round() as u32,
     )?;
 
     //let triangle_rotation_delta = degrees_to_radians(video_settings.triangle_rotation_degrees_per_frame);
-    let mut last_frame = YUVBuffer::new(settings.output_size_w as usize, settings.output_size_h as usize);
+    let mut last_frame = YUVBuffer::new(out_w as usize, out_h as usize);
     
     let base_x = settings.triangle_center_x;
     let base_y = settings.triangle_center_y;
@@ -558,7 +662,7 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
         );
 
         rgba
-            .par_chunks_exact_mut((settings.output_size_w * 4) as usize)
+            .par_chunks_exact_mut((render_w * 4) as usize)
             .enumerate()
             .for_each(|(y, row)| {
                 inner_loop::<B>(
@@ -577,7 +681,14 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
                 );
             });
 
-        last_frame = sink.write_rgba_frame(&rgba)?;
+        let frame_bytes: &[u8] = if factor > 1 {
+            final_rgba = downsample_box(&rgba, render_w, render_h, factor, out_w, out_h);
+            &final_rgba
+        } else {
+            &rgba
+        };
+
+        last_frame = sink.write_rgba_frame(frame_bytes)?;
     }
 
     // write still frames at the end
@@ -599,13 +710,15 @@ pub fn render_video_gpu_traditional(
     let fps = video_settings.fps;
     let total_frames = f32::round(video_settings.animation_duration * video_settings.fps as f32) as u32;
 
+    let (out_w, out_h) = (settings.output_size_w, settings.output_size_h);
+
     let mut sink = Mp4H264Sink::create(
         path,
-        settings.output_size_w as usize,
-        settings.output_size_h as usize,
+        out_w as usize,
+        out_h as usize,
         fps,
-        (settings.output_size_w as f32
-            * settings.output_size_h as f32
+        (out_w as f32
+            * out_h as f32
             * fps as f32
             * video_settings.quality)
             .round() as u32,
@@ -617,9 +730,19 @@ pub fn render_video_gpu_traditional(
     let base_rotation = settings.triangle_rotation_rad;
     let base_hue = settings.hue_rotation as f32;
 
-    let mut output = vec![0u8; (settings.output_size_w * settings.output_size_h * 4) as usize];
+    // `super_sample`: render each frame at `output_size * factor` into a scratch
+    // GPU readback buffer, then box-downsample down to the final `out_w x out_h`
+    // before it's handed to the H.264 encoder — same wrapper used by the CPU
+    // video path (`render_video`) and the live-preview GPU paths in src-tauri.
+    let factor = settings.super_sample.clamp(1, 4);
+    let (render_w, render_h) = (out_w * factor as u32, out_h * factor as u32);
+    let render_offset_x = settings.offset_x * factor as i32;
+    let render_offset_y = settings.offset_y * factor as i32;
 
-    let mut last_frame = YUVBuffer::new(settings.output_size_w as usize, settings.output_size_h as usize);
+    let mut render_buf = vec![0u8; (render_w * render_h * 4) as usize];
+    let mut output = vec![0u8; (out_w * out_h * 4) as usize];
+
+    let mut last_frame = YUVBuffer::new(out_w as usize, out_h as usize);
     for frame in 0..total_frames {
         //settings.triangle_rotation_rad =
         //    (base_rotation + triangle_rotation_delta * frame as f32).rem_euclid(2.0 * PI);
@@ -650,9 +773,23 @@ pub fn render_video_gpu_traditional(
 
         settings.zoom = zoom_modulation(&video_settings, frame);
 
-        gpu.render_into_buffer(&settings, &mut output)?;
-        
-        last_frame = sink.write_rgba_frame(&output)?;
+        let frame_bytes: &[u8] = if factor > 1 {
+            let render_settings = KaleidoSettings {
+                output_size_w: render_w,
+                output_size_h: render_h,
+                offset_x: render_offset_x,
+                offset_y: render_offset_y,
+                ..settings.clone()
+            };
+            gpu.render_into_buffer(&render_settings, &mut render_buf)?;
+            output = downsample_box(&render_buf, render_w, render_h, factor, out_w, out_h);
+            &output
+        } else {
+            gpu.render_into_buffer(&settings, &mut output)?;
+            &output
+        };
+
+        last_frame = sink.write_rgba_frame(frame_bytes)?;
     }
     for _ in 0..video_settings.still_frame_ending {
         sink.write_yuv_frame(&last_frame)?;
@@ -672,20 +809,32 @@ pub fn render_video_gpu(
     let fps = video_settings.fps;
     let total_frames = f32::round(video_settings.animation_duration * fps as f32) as u32;
 
+    // `super_sample`: the pipelined `GpuVideoRenderer` allocates its output
+    // textures/readback buffers once at construction, so — unlike the CPU and
+    // "traditional" GPU video paths — the renderer itself must be built at the
+    // *scaled* `render_w x render_h` size. Each submitted frame's settings are
+    // scaled to match, and each completed frame is box-downsampled back down
+    // to `out_w x out_h` before it reaches the H.264 encoder.
+    let (out_w, out_h) = (settings.output_size_w, settings.output_size_h);
+    let factor = settings.super_sample.clamp(1, 4);
+    let (render_w, render_h) = (out_w * factor as u32, out_h * factor as u32);
+    let render_offset_x = settings.offset_x * factor as i32;
+    let render_offset_y = settings.offset_y * factor as i32;
+
     let mut renderer = GpuVideoRenderer::new(
         gpu,
-        settings.output_size_w,
-        settings.output_size_h,
+        render_w,
+        render_h,
         3,
     )?;
 
     let mut sink = Mp4H264Sink::create(
         path,
-        settings.output_size_w as usize,
-        settings.output_size_h as usize,
+        out_w as usize,
+        out_h as usize,
         fps,
-        (settings.output_size_w as f32
-            * settings.output_size_h as f32
+        (out_w as f32
+            * out_h as f32
             * fps as f32
             * video_settings.quality)
             .round() as u32,
@@ -806,18 +955,41 @@ pub fn render_video_gpu(
 
         settings.zoom = base_zoom * zoom_modulation(&video_settings, frame);
 
-        renderer.submit_frame(frame, &settings)?;
+        // Submit at the (possibly scaled) render size the renderer was built with.
+        let submit_settings = if factor > 1 {
+            KaleidoSettings {
+                output_size_w: render_w,
+                output_size_h: render_h,
+                offset_x: render_offset_x,
+                offset_y: render_offset_y,
+                ..settings.clone()
+            }
+        } else {
+            settings.clone()
+        };
+
+        renderer.submit_frame(frame, &submit_settings)?;
 
         while let Some(done) = renderer.receive_oldest_blocking()? {
             let rgba = renderer.slot_bytes(done.slot_index)?;
-            last_frame = Some(sink.write_rgba_frame(rgba)?);
+            let frame_bytes: std::borrow::Cow<[u8]> = if factor > 1 {
+                std::borrow::Cow::Owned(downsample_box(rgba, render_w, render_h, factor, out_w, out_h))
+            } else {
+                std::borrow::Cow::Borrowed(rgba)
+            };
+            last_frame = Some(sink.write_rgba_frame(&frame_bytes)?);
             renderer.release_slot(done.slot_index)?;
         }
     }
 
     for done in renderer.drain_remaining_blocking()? {
         let rgba = renderer.slot_bytes(done.slot_index)?;
-        last_frame = Some(sink.write_rgba_frame(rgba)?);
+        let frame_bytes: std::borrow::Cow<[u8]> = if factor > 1 {
+            std::borrow::Cow::Owned(downsample_box(rgba, render_w, render_h, factor, out_w, out_h))
+        } else {
+            std::borrow::Cow::Borrowed(rgba)
+        };
+        last_frame = Some(sink.write_rgba_frame(&frame_bytes)?);
         renderer.release_slot(done.slot_index)?;
     }
 
@@ -865,6 +1037,9 @@ use super::*;
             kaleido_type: KaleidoType::Hexagonal,
             tile_count: 4.0,
             hue_rotation: 0,
+            anti_alias: false,
+            super_sample: 1,
+            aspect_correct: false,
         };
 
         // 3. Render using Scalar Backend

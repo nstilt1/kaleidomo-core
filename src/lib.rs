@@ -1,3 +1,4 @@
+// kaleidomo-core/src/lib.rs
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 
@@ -44,6 +45,39 @@ pub struct KaleidoSettings {
     pub triangle_rotation_rad: f32, // Rotation of the triangle in radians
     pub kaleido_type: KaleidoType,  // Type of kaleidoscope (radial, square, etc.)
     pub hue_rotation: u32, // Hue rotation in degrees (0-360)
+
+    // ── Enhancements (all default-disabled to preserve existing look/output) ──
+    /// Enables bilinear texture filtering when sampling the source image,
+    /// softening hard pixel edges and mirrored wedge seams. When `false`
+    /// (the default), sampling is nearest-neighbor, matching all prior
+    /// rendered output and existing `.kmo.json` presets that predate this field.
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    pub anti_alias: bool,
+    /// Internal supersampling factor. `1` (the default) disables supersampling
+    /// and renders at native `output_size_w`/`output_size_h`. Values `2`-`4`
+    /// render the frame at `output_size * super_sample` internally and then
+    /// box-downsample back down to the requested output size, reducing
+    /// aliasing across the whole image (not just at texture edges). Values
+    /// are clamped to `1..=4` by callers to bound the extra render cost.
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_super_sample"))]
+    pub super_sample: u8,
+    /// Corrects the kaleidoscope pattern for non-square output canvases. When
+    /// `false` (the default, matching all existing presets), the pattern is
+    /// mapped 1:1 to pixel coordinates, which visually stretches the mirrored
+    /// wedges into an ellipse whenever `output_size_w != output_size_h`. When
+    /// `true`, the vertical axis is scaled by the canvas aspect ratio before
+    /// the angle/radius is computed, so wedges stay proportional instead of
+    /// looking stretched.
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    pub aspect_correct: bool,
+}
+
+/// Default value for `KaleidoSettings::super_sample` used by `serde(default = ...)`
+/// so that presets/JSON saved before this field existed deserialize with
+/// supersampling disabled (`1`) rather than `0`.
+#[cfg(not(target_arch = "wasm32"))]
+fn default_super_sample() -> u8 {
+    1
 }
 
 pub struct VideoSettings {

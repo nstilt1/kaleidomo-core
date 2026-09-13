@@ -1,3 +1,4 @@
+// kaleidomo-core/src/backends/gpu.rs
 use std::num::NonZeroU64;
 use std::sync::mpsc;
 
@@ -682,6 +683,18 @@ pub struct GpuKaleidoSettings {
     pub source_tile_grid_height: u32,
     pub output_tile_origin_x: u32,
     pub output_tile_origin_y: u32,
+
+    // ── Enhancements (see `KaleidoSettings` in lib.rs for full docs) ──
+    /// `1` = bilinear-filter the source sample (`anti_alias`), `0` = nearest-neighbor.
+    /// Stored as `u32` rather than `bool` for `bytemuck::Pod`/WGSL uniform-buffer compatibility.
+    pub anti_alias: u32,
+    /// `1` = scale dy by the canvas aspect ratio before angle/radius computation
+    /// (`aspect_correct`), `0` = disabled (matches all prior rendered output).
+    pub aspect_correct: u32,
+    /// Padding to keep this struct's size a multiple of 16 bytes, as required for
+    /// WGSL uniform buffers.
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 impl GpuKaleidoSettings {
@@ -728,6 +741,11 @@ impl GpuKaleidoSettings {
             source_tile_grid_height: source.tile_grid_height,
             output_tile_origin_x,
             output_tile_origin_y,
+
+            anti_alias: settings.anti_alias as u32,
+            aspect_correct: settings.aspect_correct as u32,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 }
@@ -903,6 +921,9 @@ impl<'a> GpuVideoRenderer<'a> {
                 triangle_rotation_rad: 0.0,
                 kaleido_type: crate::KaleidoType::Radial,
                 hue_rotation: 0,
+                anti_alias: false,
+                super_sample: 1,
+                aspect_correct: false,
             },
             source,
             0,
