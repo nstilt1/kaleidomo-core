@@ -5,9 +5,13 @@
 pub mod backends;
 #[cfg(not(target_arch = "wasm32"))]
 mod rlib;
+#[cfg(not(target_arch = "wasm32"))]
+mod video_sink;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use rlib::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use video_sink::{VideoFrameSink, VideoSinkError};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
@@ -223,5 +227,25 @@ fn modulate(
         },
 
         _ => range_min
+    }
+}
+
+/// Disable supersampling when either internal dimension would exceed 8192.
+pub fn safe_super_sample(factor: u8, width: u32, height: u32) -> u8 {
+    let factor = factor.clamp(1, 4);
+    if width > 8192 / factor as u32 || height > 8192 / factor as u32 { 1 } else { factor }
+}
+
+#[cfg(test)]
+mod supersampling_limit_tests {
+    use super::safe_super_sample;
+    #[test]
+    fn limits_both_dimensions_without_overflow() {
+        assert_eq!(safe_super_sample(4, 2048, 2048), 4);
+        assert_eq!(safe_super_sample(4, 2049, 2048), 1);
+        assert_eq!(safe_super_sample(2, 2000, 4097), 1);
+        assert_eq!(safe_super_sample(2, 4096, 4096), 2);
+        assert_eq!(safe_super_sample(4, u32::MAX, 1), 1);
+        assert_eq!(safe_super_sample(1, 9000, 1), 1);
     }
 }

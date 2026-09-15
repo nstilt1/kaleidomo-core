@@ -692,7 +692,7 @@ impl LiveKaleidoscopeEngine {
                 hue_rotation,
                 // Enhancements — see param docs above; disabled unless explicitly requested.
                 anti_alias,
-                super_sample: super_sample.clamp(1, 4),
+                super_sample: crate::safe_super_sample(super_sample, state.canvas_width, state.canvas_height),
                 aspect_correct,
             };
             state.video_settings = video_settings.clone();
@@ -814,7 +814,7 @@ impl LiveKaleidoscopeEngine {
                 kaleido_type: kaleido_type_from_idx(kaleido_type_idx),
                 hue_rotation,
                 anti_alias,
-                super_sample: super_sample.clamp(1, 4),
+                super_sample: crate::safe_super_sample(super_sample, state.canvas_width, state.canvas_height),
                 aspect_correct,
             };
 
@@ -864,7 +864,7 @@ impl LiveKaleidoscopeEngine {
             kaleido_type: kaleido_type_from_idx(kaleido_type_idx),
             hue_rotation,
             anti_alias,
-            super_sample: super_sample.clamp(1, 4),
+            super_sample: crate::safe_super_sample(super_sample, state.canvas_width, state.canvas_height),
             aspect_correct,
         };
 

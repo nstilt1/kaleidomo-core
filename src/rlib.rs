@@ -123,7 +123,8 @@ pub fn render_kaleidoscope_with_backend<B: KaleidoBackend + DaydreamBackend>(
     source: &DynamicImage,
     settings: KaleidoSettings,
 ) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
-    let factor = settings.super_sample.clamp(1, 4);
+    let (src_w, src_h) = source.dimensions();
+    let factor = crate::safe_super_sample(settings.super_sample, src_w, src_h);
     if factor > 1 {
         // `super_sample` path: render at `output_size * factor` internally using the
         // exact same per-backend math (nothing below needs to know about
@@ -136,6 +137,13 @@ pub fn render_kaleidoscope_with_backend<B: KaleidoBackend + DaydreamBackend>(
             output_size_h: out_h * factor as u32,
             offset_x: settings.offset_x * factor as i32,
             offset_y: settings.offset_y * factor as i32,
+            // `zoom` must scale with the enlarged canvas too: the renderer's
+            // `source_scale = width_over_2 / zoom` ties visible source
+            // content to the actual render width, so leaving `zoom`
+            // unscaled while `output_size_w/h` grow by `factor` was
+            // silently showing `factor`x more source content (i.e.
+            // zooming out) the higher `super_sample` was set.
+            zoom: settings.zoom * factor as f32,
             ..settings.clone()
         };
         let big = render_kaleidoscope_with_backend_inner::<B>(source, &big_settings);
@@ -232,7 +240,8 @@ pub fn render_kaleidoscope_with_gpu(
     source: &DynamicImage,
     settings: KaleidoSettings,
 ) -> anyhow::Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
-    let factor = settings.super_sample.clamp(1, 4);
+    let (src_w, src_h) = source.dimensions();
+    let factor = crate::safe_super_sample(settings.super_sample, src_w, src_h);
     let (out_w, out_h) = (settings.output_size_w, settings.output_size_h);
     // `super_sample`: render at `output_size * factor` on the GPU, same as the CPU
     // backends' wrapper, then box-downsample back down to the requested size.
@@ -242,6 +251,8 @@ pub fn render_kaleidoscope_with_gpu(
             output_size_h: out_h * factor as u32,
             offset_x: settings.offset_x * factor as i32,
             offset_y: settings.offset_y * factor as i32,
+            // See the matching comment in `render_kaleidoscope_with_backend`.
+            zoom: settings.zoom * factor as f32,
             ..settings.clone()
         }
     } else {
@@ -273,175 +284,28 @@ pub fn render_kaleidoscope_with_gpu(
         .context("GPU returned an invalid output buffer length")
 }
 
-use openh264::encoder::Encoder;
-use openh264::formats::{RgbaSliceU8, YUVBuffer};
-use openh264::encoder::EncoderConfig;
-
-use std::fs::{remove_file, File};
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
-
-use minimp4::Mp4Muxer;
-use openh264::encoder::{
-    BitRate, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
-};
-use openh264::OpenH264API;
-
-pub struct Mp4H264Sink {
-    width: usize,
-    height: usize,
-    fps: u32,
-    output_mp4_path: PathBuf,
-    temp_h264_path: PathBuf,
-    encoder: Encoder,
-    h264_writer: BufWriter<File>,
-    keep_temp_h264: bool,
-}
-
-impl Mp4H264Sink {
-    pub fn create<P: AsRef<Path>>(
-        output_mp4_path: P,
-        width: usize,
-        height: usize,
-        fps: u32,
-        bitrate_bps: u32,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        if width == 0 || height == 0 {
-            return Err("width and height must be non-zero".into());
-        }
-
-        if width % 2 != 0 || height % 2 != 0 {
-            return Err("width and height must both be even".into());
-        }
-
-        if fps == 0 {
-            return Err("fps must be non-zero".into());
-        }
-
-        let mut output_mp4_path = output_mp4_path.as_ref().to_path_buf();
-        match output_mp4_path.extension() {
-            Some(ext) => {
-                if ext != "mp4" {
-                    output_mp4_path.set_extension("mp4");
-                }
-            },
-            None => {
-                output_mp4_path.set_extension("mp4");
-            }
-        }
-
-        let temp_h264_path = {
-            let mut p = output_mp4_path.clone();
-            let ext = match p.extension().and_then(|e| e.to_str()) {
-                Some(ext) if !ext.is_empty() => format!("{ext}.tmp.h264"),
-                _ => String::from("tmp.h264"),
-            };
-            p.set_extension(ext);
-            p
-        };
-
-        let h264_file = File::create(&temp_h264_path)?;
-        let h264_writer = BufWriter::new(h264_file);
-
-        let config = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(bitrate_bps))
-            .max_frame_rate(FrameRate::from_hz(fps as f32))
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            .skip_frames(false)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(fps));
-
-        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)?;
-
-        Ok(Self {
-            width,
-            height,
-            fps,
-            output_mp4_path,
-            temp_h264_path,
-            encoder,
-            h264_writer,
-            keep_temp_h264: false,
-        })
-    }
-
-    pub fn keep_temp_h264(mut self, keep: bool) -> Self {
-        self.keep_temp_h264 = keep;
-        self
-    }
-
-    pub fn write_rgba_frame(&mut self, rgba: &[u8]) -> Result<YUVBuffer, Box<dyn std::error::Error>> {
-        let expected_len = self.width * self.height * 4;
-        if rgba.len() != expected_len {
-            return Err(format!(
-                "invalid RGBA buffer length: got {}, expected {}",
-                rgba.len(),
-                expected_len
-            )
-            .into());
-        }
-
-        let rgba_source = RgbaSliceU8::new(rgba, (self.width, self.height));
-        let yuv = YUVBuffer::from_rgb_source(rgba_source);
-
-        let bitstream = self.encoder.encode(&yuv)?;
-        bitstream.write(&mut self.h264_writer)?;
-
-        Ok(yuv)
-    }
-
-    pub fn write_yuv_frame(&mut self, yuv: &YUVBuffer) -> Result<(), Box<dyn std::error::Error>> {
-        let bitstream = self.encoder.encode(yuv)?;
-        bitstream.write(&mut self.h264_writer)?;
-        Ok(())
-    }
-
-    pub fn finish(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.h264_writer.flush()?;
-        drop(self.h264_writer);
-
-        let mut h264_reader = BufReader::new(File::open(&self.temp_h264_path)?);
-        let mut h264_bytes = Vec::new();
-        h264_reader.read_to_end(&mut h264_bytes)?;
-
-        let mp4_file = File::create(&self.output_mp4_path)?;
-        let mut muxer = Mp4Muxer::new(mp4_file);
-        muxer.init_video(self.width as i32, self.height as i32, false, "video");
-        muxer.write_video_with_fps(&h264_bytes, self.fps);
-        muxer.close();
-
-        if !self.keep_temp_h264 {
-            let _ = remove_file(&self.temp_h264_path);
-        }
-
-        Ok(())
-    }
-
-    pub fn temp_h264_path(&self) -> &Path {
-        &self.temp_h264_path
-    }
-}
+use crate::video_sink::{VideoFrameSink, VideoSinkError};
 
 pub fn render_video_with_auto_backend(
     source: &DynamicImage,
     settings: KaleidoSettings,
     video_settings: VideoSettings,
-    path: &str,
+    sink: &mut dyn VideoFrameSink,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("avx2") {
-            return render_video::<crate::backends::avx2::__m256>(source, settings, video_settings, path);
+            return render_video::<crate::backends::avx2::__m256>(source, settings, video_settings, sink);
         } else if is_x86_feature_detected!("sse2") {
-            return render_video::<crate::backends::sse2::__m128>(source, settings, video_settings, path);
+            return render_video::<crate::backends::sse2::__m128>(source, settings, video_settings, sink);
         } else {
-            return render_video::<f32>(source, settings, video_settings, path);
+            return render_video::<f32>(source, settings, video_settings, sink);
         }
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        render_video::<Register>(source, settings, video_settings, path)
-        //render_video::<f32>(source, settings, path)
+        render_video::<Register>(source, settings, video_settings, sink)
+        //render_video::<f32>(source, settings, sink)
     }
 }
 
@@ -502,7 +366,7 @@ fn apply_video_frame_modulation(
     base_y: f32,
     base_rotation: f32,
     base_hue: f32,
-    base_zoom: f32,
+    zoom_scale: f32,
     state: &mut VideoFrameModulationState,
 ) -> u32 {
     let fps = video_settings.fps.max(1);
@@ -586,7 +450,11 @@ fn apply_video_frame_modulation(
             rotation_modulation.rem_euclid(2.0 * PI);
     }
 
-    settings.zoom = base_zoom * zoom_modulation(video_settings, frame);
+    // zoom_min/zoom_max are already absolute renderer zoom values supplied by
+    // the frontend. Do not multiply them by the base Zoom setting again.
+    // zoom_scale is only the supersampling factor, preserving the same source
+    // radius when rendering into a larger intermediate frame.
+    settings.zoom = zoom_modulation(video_settings, frame) * zoom_scale;
 
     modulate(
         video_settings,
@@ -606,7 +474,7 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
     source: &DynamicImage,
     mut settings: KaleidoSettings,
     video_settings: VideoSettings,
-    path: &str,
+    sink: &mut dyn VideoFrameSink,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fps = video_settings.fps;
     let total_frames = f32::round(video_settings.animation_duration * fps as f32) as u32;
@@ -616,7 +484,7 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
     // H.264 encoder. `width_over_2`/`center_x`/`center_y` are computed against the
     // *scaled* dimensions so `inner_loop` draws the (larger) frame correctly; the
     // final encoded video is still exactly `output_size_w x output_size_h`.
-    let factor = settings.super_sample.clamp(1, 4);
+    let factor = crate::safe_super_sample(settings.super_sample, settings.output_size_w, settings.output_size_h);
     let (out_w, out_h) = (settings.output_size_w, settings.output_size_h);
     let (render_w, render_h) = (out_w * factor as u32, out_h * factor as u32);
     let render_offset_x = settings.offset_x * factor as i32;
@@ -629,22 +497,19 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
 
     let mut rgba = vec![0u8; (render_w * render_h * 4) as usize];
     let mut final_rgba = vec![0u8; (out_w * out_h * 4) as usize];
-    let mut sink = Mp4H264Sink::create(
-        path,
-        out_w as usize,
-        out_h as usize,
-        fps,
-        (out_w as f32 * out_h as f32 * fps as f32 * video_settings.quality).round() as u32,
-    )?;
 
     //let triangle_rotation_delta = degrees_to_radians(video_settings.triangle_rotation_degrees_per_frame);
-    let mut last_frame = YUVBuffer::new(out_w as usize, out_h as usize);
-    
+    // Owned copy of the most recently written frame, retained only so
+    // `still_frame_ending` can resend it without rerendering.
+    let mut last_frame: Vec<u8> = vec![0u8; (out_w * out_h * 4) as usize];
+
     let base_x = settings.triangle_center_x;
     let base_y = settings.triangle_center_y;
     let base_rotation = settings.triangle_rotation_rad;
     let base_hue = settings.hue_rotation as f32;
-    let base_zoom = settings.zoom;
+    // The animated zoom bounds are already absolute zoom values for the final
+    // output width. Only scale by the supersampling factor here.
+    let zoom_scale = factor as f32;
 
     let mut modulation_state = VideoFrameModulationState::default();
     
@@ -657,7 +522,7 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
             base_y,
             base_rotation,
             base_hue,
-            base_zoom,
+            zoom_scale,
             &mut modulation_state,
         );
 
@@ -688,41 +553,37 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
             &rgba
         };
 
-        last_frame = sink.write_rgba_frame(frame_bytes)?;
+        sink.write_rgba_frame(frame_bytes).map_err(sink_err)?;
+        last_frame.copy_from_slice(frame_bytes);
     }
 
     // write still frames at the end
     for _still_frame in 0..video_settings.still_frame_ending {
-        sink.write_yuv_frame(&last_frame)?;
+        sink.write_rgba_frame(&last_frame).map_err(sink_err)?;
     }
 
-    sink.finish()?;
+    sink.finish().map_err(sink_err)?;
     Ok(())
+}
+
+/// Converts a boxed `VideoSinkError` (`Send + Sync`) into the plain
+/// `Box<dyn std::error::Error>` used throughout this module's render
+/// functions.
+fn sink_err(e: VideoSinkError) -> Box<dyn std::error::Error> {
+    e
 }
 
 /// Renders a video with the GPU.
 pub fn render_video_gpu_traditional(
     mut settings: KaleidoSettings,
     video_settings: VideoSettings,
-    path: &str,
+    sink: &mut dyn VideoFrameSink,
     gpu: &mut GpuBackend
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fps = video_settings.fps;
     let total_frames = f32::round(video_settings.animation_duration * video_settings.fps as f32) as u32;
 
     let (out_w, out_h) = (settings.output_size_w, settings.output_size_h);
-
-    let mut sink = Mp4H264Sink::create(
-        path,
-        out_w as usize,
-        out_h as usize,
-        fps,
-        (out_w as f32
-            * out_h as f32
-            * fps as f32
-            * video_settings.quality)
-            .round() as u32,
-    )?;
 
     //let triangle_rotation_delta =
     //    degrees_to_radians(video_settings.triangle_rotation_degrees_per_frame);
@@ -734,7 +595,7 @@ pub fn render_video_gpu_traditional(
     // GPU readback buffer, then box-downsample down to the final `out_w x out_h`
     // before it's handed to the H.264 encoder — same wrapper used by the CPU
     // video path (`render_video`) and the live-preview GPU paths in src-tauri.
-    let factor = settings.super_sample.clamp(1, 4);
+    let factor = crate::safe_super_sample(settings.super_sample, settings.output_size_w, settings.output_size_h);
     let (render_w, render_h) = (out_w * factor as u32, out_h * factor as u32);
     let render_offset_x = settings.offset_x * factor as i32;
     let render_offset_y = settings.offset_y * factor as i32;
@@ -742,7 +603,9 @@ pub fn render_video_gpu_traditional(
     let mut render_buf = vec![0u8; (render_w * render_h * 4) as usize];
     let mut output = vec![0u8; (out_w * out_h * 4) as usize];
 
-    let mut last_frame = YUVBuffer::new(out_w as usize, out_h as usize);
+    // Owned copy of the most recently written frame, retained only so
+    // `still_frame_ending` can resend it without rerendering.
+    let mut last_frame: Vec<u8> = vec![0u8; (out_w * out_h * 4) as usize];
     for frame in 0..total_frames {
         //settings.triangle_rotation_rad =
         //    (base_rotation + triangle_rotation_delta * frame as f32).rem_euclid(2.0 * PI);
@@ -771,8 +634,14 @@ pub fn render_video_gpu_traditional(
         .round()
         .rem_euclid(360.0) as u32;
 
-        settings.zoom = zoom_modulation(&video_settings, frame);
-
+        // Scaled by `factor`: `source_scale = width_over_2 / zoom` ties
+        // visible source content to the actual render width, which is
+        // `factor`x larger than `out_w`/`out_h` here. `zoom_modulation`
+        // itself is supersample-unaware, so the scaling has to happen at
+        // the assignment — `render_settings` below inherits it via
+        // `..settings.clone()`, and the `factor == 1` branch is a no-op
+        // multiply, so this is correct either way.
+        settings.zoom = zoom_modulation(&video_settings, frame) * factor as f32;
         let frame_bytes: &[u8] = if factor > 1 {
             let render_settings = KaleidoSettings {
                 output_size_w: render_w,
@@ -789,13 +658,14 @@ pub fn render_video_gpu_traditional(
             &output
         };
 
-        last_frame = sink.write_rgba_frame(frame_bytes)?;
+        sink.write_rgba_frame(frame_bytes).map_err(sink_err)?;
+        last_frame.copy_from_slice(frame_bytes);
     }
     for _ in 0..video_settings.still_frame_ending {
-        sink.write_yuv_frame(&last_frame)?;
+        sink.write_rgba_frame(&last_frame).map_err(sink_err)?;
     }
 
-    sink.finish()?;
+    sink.finish().map_err(sink_err)?;
 
     Ok(())
 }
@@ -803,7 +673,7 @@ pub fn render_video_gpu_traditional(
 pub fn render_video_gpu(
     mut settings: KaleidoSettings,
     video_settings: VideoSettings,
-    path: &str,
+    sink: &mut dyn VideoFrameSink,
     gpu: &mut GpuBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fps = video_settings.fps;
@@ -816,7 +686,7 @@ pub fn render_video_gpu(
     // scaled to match, and each completed frame is box-downsampled back down
     // to `out_w x out_h` before it reaches the H.264 encoder.
     let (out_w, out_h) = (settings.output_size_w, settings.output_size_h);
-    let factor = settings.super_sample.clamp(1, 4);
+    let factor = crate::safe_super_sample(settings.super_sample, settings.output_size_w, settings.output_size_h);
     let (render_w, render_h) = (out_w * factor as u32, out_h * factor as u32);
     let render_offset_x = settings.offset_x * factor as i32;
     let render_offset_y = settings.offset_y * factor as i32;
@@ -828,25 +698,13 @@ pub fn render_video_gpu(
         3,
     )?;
 
-    let mut sink = Mp4H264Sink::create(
-        path,
-        out_w as usize,
-        out_h as usize,
-        fps,
-        (out_w as f32
-            * out_h as f32
-            * fps as f32
-            * video_settings.quality)
-            .round() as u32,
-    )?;
-
     // let triangle_rotation_delta =
     //     degrees_to_radians(video_settings.triangle_rotation_degrees_per_frame);
 
     let base_rotation = settings.triangle_rotation_rad;
     let base_hue = settings.hue_rotation as f32;
 
-    let mut last_frame: Option<YUVBuffer> = None;
+    let mut last_frame: Option<Vec<u8>> = None;
 
     let mut smoothed_audio_peak = 0.0_f32;
     let mut accumulated_orientation_offset = 0.0_f32;
@@ -855,7 +713,9 @@ pub fn render_video_gpu(
     let base_y = settings.triangle_center_y;
     let base_rotation = settings.triangle_rotation_rad;
     let base_hue = settings.hue_rotation as f32;
-    let base_zoom = settings.zoom;
+    // The animated zoom bounds are already absolute zoom values for the final
+    // output width. Only scale by the supersampling factor here.
+    let zoom_scale = factor as f32;
 
     let mut modulation_state = VideoFrameModulationState::default();
     
@@ -947,13 +807,12 @@ pub fn render_video_gpu(
             base_y,
             base_rotation,
             base_hue,
-            base_zoom,
+            zoom_scale,
             &mut modulation_state,
         );
 
         settings.hue_rotation = hue_rotation;
 
-        settings.zoom = base_zoom * zoom_modulation(&video_settings, frame);
 
         // Submit at the (possibly scaled) render size the renderer was built with.
         let submit_settings = if factor > 1 {
@@ -977,7 +836,8 @@ pub fn render_video_gpu(
             } else {
                 std::borrow::Cow::Borrowed(rgba)
             };
-            last_frame = Some(sink.write_rgba_frame(&frame_bytes)?);
+            sink.write_rgba_frame(&frame_bytes).map_err(sink_err)?;
+            last_frame = Some(frame_bytes.into_owned());
             renderer.release_slot(done.slot_index)?;
         }
     }
@@ -989,17 +849,18 @@ pub fn render_video_gpu(
         } else {
             std::borrow::Cow::Borrowed(rgba)
         };
-        last_frame = Some(sink.write_rgba_frame(&frame_bytes)?);
+        sink.write_rgba_frame(&frame_bytes).map_err(sink_err)?;
+        last_frame = Some(frame_bytes.into_owned());
         renderer.release_slot(done.slot_index)?;
     }
 
     if let Some(last_frame) = last_frame {
         for _ in 0..video_settings.still_frame_ending {
-            sink.write_yuv_frame(&last_frame)?;
+            sink.write_rgba_frame(&last_frame).map_err(sink_err)?;
         }
     }
 
-    sink.finish()?;
+    sink.finish().map_err(sink_err)?;
     Ok(())
 }
 
