@@ -7,7 +7,7 @@ pub use core::arch::x86_64::*;
 use image::GenericImageView;
 
 use crate::{DaydreamBackend, image::DynamicImage, KaleidoBackend};
-use crate::backends::{bilinear_sample, bilinear_sample_hue_shift};
+use crate::backends::{reconstruction_sample, reconstruction_sample_hue_shift};
 
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -161,6 +161,8 @@ impl KaleidoBackend for __m256 {
         )
     }
     #[target_feature(enable = "avx2")]
+    #[inline] unsafe fn write_lanes(self, output: &mut [f32]) { unsafe { _mm256_storeu_ps(output.as_mut_ptr(), self); } }
+    #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn normalize_coords(&mut self, center: Self) {
         *self = _mm256_sub_ps(*self, center);
@@ -274,7 +276,7 @@ impl KaleidoBackend for __m256 {
     }
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn store_pixel(
+    unsafe fn store_pixel<const SAMPLING_MODE: u8>(
         output: &mut [u8],
         _x: u32,
         sx: Self,
@@ -282,7 +284,6 @@ impl KaleidoBackend for __m256 {
         source: &DynamicImage,
         sw: u32,
         sh: u32,
-        bilinear: bool,
     ) {
         unsafe {
             let zero = _mm256_set1_ps(0.0);
@@ -302,7 +303,7 @@ impl KaleidoBackend for __m256 {
 
             let lane_mask = _mm256_movemask_ps(v_mask) as u32;
 
-            if bilinear {
+            if SAMPLING_MODE != 0 {
                 // anti_alias path — see the SSE2 backend's `store_pixel` for the
                 // rationale: bilinear gathers are data-dependent per lane, so we
                 // extract raw floats and blend each pixel with the shared helper.
@@ -317,7 +318,7 @@ impl KaleidoBackend for __m256 {
                             && raw_y[i] >= -1.0 && raw_y[i] < sh as f32 + 1.0)
                     {
                         let offset = i * 4;
-                        let pixel = bilinear_sample(source, raw_x[i], raw_y[i], sw, sh);
+                        let pixel = reconstruction_sample::<SAMPLING_MODE>(source, raw_x[i], raw_y[i], sw, sh);
                         output[offset..offset + 4].copy_from_slice(&pixel);
                     }
                 }
@@ -921,7 +922,7 @@ impl DaydreamBackend for __m256 {
 
     #[target_feature(enable = "avx,avx2")]
     #[inline]
-    unsafe fn store_pixel_hue_shift(
+    unsafe fn store_pixel_hue_shift<const SAMPLING_MODE: u8>(
         buff: &mut [u8],
         _x: u32,
         sx: Self,
@@ -941,12 +942,11 @@ impl DaydreamBackend for __m256 {
         three_sixty: Self,
         five: Self,
         three: Self,
-        bilinear: bool,
     ) {
         use std::arch::x86_64::*;
 
         unsafe {
-            if bilinear {
+            if SAMPLING_MODE != 0 {
                 // anti_alias path — see `store_pixel` above for the rationale.
                 let mut raw_x = [0.0f32; Self::NUM_FLOATS];
                 let mut raw_y = [0.0f32; Self::NUM_FLOATS];
@@ -959,7 +959,7 @@ impl DaydreamBackend for __m256 {
                         && raw_y[i] >= -1.0 && raw_y[i] < source_height as f32 + 1.0
                     {
                         let offset = i * 4;
-                        let pixel = bilinear_sample_hue_shift(
+                        let pixel = reconstruction_sample_hue_shift::<SAMPLING_MODE>(
                             source, raw_x[i], raw_y[i], source_width, source_height, hue_shift_degrees,
                         );
                         buff[offset..offset + 4].copy_from_slice(&pixel);

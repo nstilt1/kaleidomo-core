@@ -3,6 +3,7 @@
 #![feature(generic_const_exprs)]
 
 pub mod backends;
+pub mod enhancement;
 #[cfg(not(target_arch = "wasm32"))]
 mod rlib;
 #[cfg(not(target_arch = "wasm32"))]
@@ -56,7 +57,12 @@ pub struct KaleidoSettings {
     /// (the default), sampling is nearest-neighbor, matching all prior
     /// rendered output and existing `.kmo.json` presets that predate this field.
     #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
-    pub anti_alias: bool,
+    /// Source reconstruction mode: 0 = nearest, 1 = bilinear, 2 = Catmull-Rom bicubic.
+    pub anti_alias: u8,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_true"))]
+    pub derivative_mipmapping: bool,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_anisotropy"))]
+    pub anisotropy_level: u8,
     /// Internal supersampling factor. `1` (the default) disables supersampling
     /// and renders at native `output_size_w`/`output_size_h`. Values `2`-`4`
     /// render the frame at `output_size * super_sample` internally and then
@@ -83,6 +89,10 @@ pub struct KaleidoSettings {
 fn default_super_sample() -> u8 {
     1
 }
+#[cfg(not(target_arch = "wasm32"))]
+fn default_true() -> bool { true }
+#[cfg(not(target_arch = "wasm32"))]
+fn default_anisotropy() -> u8 { 1 }
 
 pub struct VideoSettings {
     /// The duration of the animation

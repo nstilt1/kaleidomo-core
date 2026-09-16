@@ -1,4 +1,9 @@
 // kalidomo.wgsl
+// Specialized by WGPU into three cached pipelines; never changed dynamically
+// inside a dispatch (0 nearest, 1 bilinear, 2 Catmull-Rom bicubic).
+override reconstruction_mode: u32 = 0u;
+override derivative_mipmapping: u32 = 1u;
+override anisotropy_level: u32 = 1u;
 
 struct KaleidoSettings {
     count: u32,
@@ -78,6 +83,28 @@ fn load_source_pixel(src_i: vec2<i32>) -> vec4<f32> {
     return textureLoad(input_tex, vec2<i32>(local_x, local_y), layer, 0);
 }
 
+fn load_source_pixel_mip(src: vec2<f32>, level: u32) -> vec4<f32> {
+    let scale = f32(1u << level);
+    let base = vec2<i32>(floor(src));
+    let tile_size = i32(settings.source_tile_size);
+    let tile = vec2<u32>(u32(max(base.x, 0) / tile_size), u32(max(base.y, 0) / tile_size));
+    let layer = i32(tile.y * settings.source_tile_grid_width + tile.x);
+    let local_base = vec2<i32>(base.x % tile_size, base.y % tile_size);
+    return textureLoad(input_tex, vec2<i32>(floor(vec2<f32>(local_base) / scale)), layer, i32(level));
+}
+
+fn sample_bilinear_mip(src: vec2<f32>, level: u32) -> vec4<f32> {
+    let scale = f32(1u << level);
+    let mip_pos = src / scale;
+    let base = floor(mip_pos);
+    let fraction = fract(mip_pos);
+    let p00 = load_source_pixel_mip(base * scale, level);
+    let p10 = load_source_pixel_mip((base + vec2<f32>(1.0, 0.0)) * scale, level);
+    let p01 = load_source_pixel_mip((base + vec2<f32>(0.0, 1.0)) * scale, level);
+    let p11 = load_source_pixel_mip((base + vec2<f32>(1.0, 1.0)) * scale, level);
+    return mix(mix(p00, p10, fraction.x), mix(p01, p11, fraction.x), fraction.y);
+}
+
 // `anti_alias` path: bilinear-blends the four nearest texels around floating
 // point source coordinates `(sx, sy)` instead of rounding to the nearest one.
 // Mirrors the CPU backends' shared `bilinear_sample` helper in backends/mod.rs
@@ -96,6 +123,68 @@ fn load_source_pixel_bilinear(sx: f32, sy: f32) -> vec4<f32> {
     let top = mix(p00, p10, fx);
     let bottom = mix(p01, p11, fx);
     return mix(top, bottom, fy);
+}
+
+fn catmull_rom_weights(t: f32) -> vec4<f32> {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    return vec4<f32>(
+        -0.5 * t + t2 - 0.5 * t3,
+        1.0 - 2.5 * t2 + 1.5 * t3,
+        0.5 * t + 2.0 * t2 - 1.5 * t3,
+        -0.5 * t2 + 0.5 * t3,
+    );
+}
+
+// Explicit 16-tap Catmull-Rom reconstruction. This deliberately uses
+// textureLoad so bicubic never falls through to a fixed-function sampler.
+fn load_source_pixel_bicubic(sx: f32, sy: f32) -> vec4<f32> {
+    let base = vec2<i32>(i32(floor(sx)), i32(floor(sy)));
+    let weights_x = catmull_rom_weights(fract(sx));
+    let weights_y = catmull_rom_weights(fract(sy));
+    var color = vec4<f32>(0.0);
+    for (var row = 0; row < 4; row += 1) {
+        var horizontal = vec4<f32>(0.0);
+        for (var column = 0; column < 4; column += 1) {
+            let coordinate = clamp(
+                base + vec2<i32>(column - 1, row - 1),
+                vec2<i32>(0),
+                vec2<i32>(i32(settings.source_width) - 1, i32(settings.source_height) - 1),
+            );
+            horizontal += load_source_pixel(coordinate) * weights_x[column];
+        }
+        color += horizontal * weights_y[row];
+    }
+    return clamp(color, vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+fn sample_bicubic_mip(src: vec2<f32>, level: u32) -> vec4<f32> {
+    let scale = f32(1u << level);
+    let mip_pos = src / scale;
+    let base = vec2<i32>(floor(mip_pos));
+    let wx = catmull_rom_weights(fract(mip_pos.x));
+    let wy = catmull_rom_weights(fract(mip_pos.y));
+    var color = vec4<f32>(0.0);
+    for (var row = 0; row < 4; row += 1) {
+        var horizontal = vec4<f32>(0.0);
+        for (var column = 0; column < 4; column += 1) {
+            horizontal += load_source_pixel_mip(vec2<f32>(base + vec2<i32>(column - 1, row - 1)) * scale, level) * wx[column];
+        }
+        color += horizontal * wy[row];
+    }
+    return clamp(color, vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+fn sample_anisotropic(src: vec2<f32>, major: vec2<f32>, level: u32) -> vec4<f32> {
+    var color = vec4<f32>(0.0);
+    for (var tap = 0u; tap < anisotropy_level; tap += 1u) {
+        let offset = (f32(tap) + 0.5) / f32(anisotropy_level) - 0.5;
+        let position = src + major * offset;
+        if (reconstruction_mode == 2u) { color += sample_bicubic_mip(position, level); }
+        else if (reconstruction_mode == 1u) { color += sample_bilinear_mip(position, level); }
+        else { color += load_source_pixel_mip(position, level); }
+    }
+    return color / f32(anisotropy_level);
 }
 
 fn euclidean_modulo(a : f32, b : f32) -> f32 {
@@ -434,23 +523,7 @@ fn apply_hue_rotation(rgb: vec3<f32>) -> vec3<f32> {
     return final_rgb;
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let local_x = gid.x;
-    let local_y = gid.y;
-
-    let out_dims = textureDimensions(output_tex);
-    if (local_x >= out_dims.x || local_y >= out_dims.y) {
-        return;
-    }
-
-    let x = settings.output_tile_origin_x + local_x;
-    let y = settings.output_tile_origin_y + local_y;
-
-    if (x >= settings.output_size_w || y >= settings.output_size_h) {
-        return;
-    }
-
+fn map_output_coordinate(x: u32, y: u32) -> vec2<f32> {
     let center_x = f32(settings.output_size_w) * 0.5 + f32(settings.offset_x);
     let center_y = f32(settings.output_size_h) * 0.5 + f32(settings.offset_y);
 
@@ -490,6 +563,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             mapped = vec2<f32>(dx, dy);
         }
     }
+    return mapped;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let local_x = gid.x;
+    let local_y = gid.y;
+    let out_dims = textureDimensions(output_tex);
+    if (local_x >= out_dims.x || local_y >= out_dims.y) { return; }
+    let x = settings.output_tile_origin_x + local_x;
+    let y = settings.output_tile_origin_y + local_y;
+    if (x >= settings.output_size_w || y >= settings.output_size_h) { return; }
+
+    let mapped = map_output_coordinate(x, y);
+    let mapped_dx = map_output_coordinate(min(x + 1u, settings.output_size_w - 1u), y) - mapped;
+    let mapped_dy = map_output_coordinate(x, min(y + 1u, settings.output_size_h - 1u)) - mapped;
+    let minor_footprint = max(min(length(mapped_dx), length(mapped_dy)), 1.0);
+    let mip_level = select(0u, u32(clamp(floor(log2(minor_footprint)), 0.0, f32(textureNumLevels(input_tex) - 1u))), derivative_mipmapping != 0u);
+    let major = select(mapped_dy, mapped_dx, dot(mapped_dx, mapped_dx) >= dot(mapped_dy, mapped_dy));
 
     let src_x = round(mapped.x);
     let src_y = round(mapped.y);
@@ -499,7 +591,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // to the nearest one. Uses a 1px-tolerant bounds check (mirroring the CPU
     // backends' `bilinear_sample`) since the blend itself clamps to the image
     // edge, so texels just outside the strict integer bounds are still valid.
-    if (settings.anti_alias != 0u) {
+    if (reconstruction_mode == 2u) {
+        let in_bounds_bicubic = mapped.x >= -2.0 && mapped.x < f32(settings.source_width) + 2.0
+            && mapped.y >= -2.0 && mapped.y < f32(settings.source_height) + 2.0;
+        if (!in_bounds_bicubic) {
+            textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(0.0));
+            return;
+        }
+        let color = sample_anisotropic(mapped, major, mip_level);
+        textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(apply_hue_rotation(color.rgb), color.a));
+        return;
+    }
+
+    if (reconstruction_mode == 1u) {
         let in_bounds_bilinear = mapped.x >= -1.0 && mapped.x < f32(settings.source_width) + 1.0
             && mapped.y >= -1.0 && mapped.y < f32(settings.source_height) + 1.0;
         if (!in_bounds_bilinear) {
@@ -507,9 +611,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             return;
         }
 
-        let clamped_x = clamp(mapped.x, 0.0, f32(settings.source_width) - 1.0);
-        let clamped_y = clamp(mapped.y, 0.0, f32(settings.source_height) - 1.0);
-        let color = load_source_pixel_bilinear(clamped_x, clamped_y);
+        let clamped_position = clamp(mapped, vec2<f32>(0.0), vec2<f32>(f32(settings.source_width) - 1.0, f32(settings.source_height) - 1.0));
+        let color = sample_anisotropic(clamped_position, major, mip_level);
         let final_rgb = apply_hue_rotation(color.rgb);
         textureStore(
             output_tex,
@@ -524,7 +627,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let color = load_source_pixel(src_i);
+    let color = sample_anisotropic(mapped, major, mip_level);
     let final_rgb = apply_hue_rotation(color.rgb);
 
     textureStore(

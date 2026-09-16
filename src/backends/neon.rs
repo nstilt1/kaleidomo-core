@@ -4,7 +4,7 @@ use core::arch::aarch64::*;
 use image::GenericImageView;
 
 use crate::backends::DaydreamBackend;
-use crate::backends::{bilinear_sample, bilinear_sample_hue_shift};
+use crate::backends::{reconstruction_sample, reconstruction_sample_hue_shift};
 
 use super::KaleidoBackend;
 
@@ -140,6 +140,7 @@ impl KaleidoBackend for float32x4_t {
             (x_vec, y_vec)
         }
     }
+    #[inline] unsafe fn write_lanes(self, output: &mut [f32]) { unsafe { vst1q_f32(output.as_mut_ptr(), self); } }
 
     #[target_feature(enable = "neon")]
     #[inline]
@@ -251,7 +252,7 @@ impl KaleidoBackend for float32x4_t {
 
     #[target_feature(enable = "neon")]
     #[inline]
-    unsafe fn store_pixel(
+    unsafe fn store_pixel<const SAMPLING_MODE: u8>(
         output: &mut [u8],
         _x: u32,
         sx: Self,
@@ -259,7 +260,6 @@ impl KaleidoBackend for float32x4_t {
         source: &image::DynamicImage,
         sw: u32,
         sh: u32,
-        bilinear: bool,
     ) {
         unsafe {
             // 1. Check bounds on floats first to match 'sx >= 0.0 && sx < sw'
@@ -272,7 +272,7 @@ impl KaleidoBackend for float32x4_t {
                 vandq_u32(vcgeq_f32(sy, zero), vcltq_f32(sy, sh_v)),
             );
 
-            if bilinear {
+            if SAMPLING_MODE != 0 {
                 // anti_alias path: extract raw per-lane floats and blend each pixel
                 // via the shared scalar `bilinear_sample` helper (see the SSE2
                 // backend's `store_pixel` for the full rationale).
@@ -286,7 +286,7 @@ impl KaleidoBackend for float32x4_t {
                         && raw_y[i] >= -1.0 && raw_y[i] < sh as f32 + 1.0
                     {
                         let base_idx = i * 4;
-                        let pixel = bilinear_sample(source, raw_x[i], raw_y[i], sw, sh);
+                        let pixel = reconstruction_sample::<SAMPLING_MODE>(source, raw_x[i], raw_y[i], sw, sh);
                         output[base_idx..base_idx + 4].copy_from_slice(&pixel);
                     }
                 }
@@ -830,7 +830,7 @@ impl DaydreamBackend for float32x4_t {
     }
     #[target_feature(enable = "neon")]
     #[inline]
-    unsafe fn store_pixel_hue_shift(
+    unsafe fn store_pixel_hue_shift<const SAMPLING_MODE: u8>(
         buff: &mut [u8],
         _x: u32,
         sx: Self,
@@ -850,10 +850,9 @@ impl DaydreamBackend for float32x4_t {
         three_sixty: Self,
         five: Self,
         three: Self,
-        bilinear: bool,
     ) {
         unsafe {
-            if bilinear {
+            if SAMPLING_MODE != 0 {
                 // anti_alias path — see the SSE2 backend's `store_pixel` for the rationale.
                 let mut raw_x = [0.0f32; 4];
                 let mut raw_y = [0.0f32; 4];
@@ -868,7 +867,7 @@ impl DaydreamBackend for float32x4_t {
                         && raw_y[i] >= -1.0 && raw_y[i] < source_height as f32 + 1.0
                     {
                         let base_idx = i * 4;
-                        let pixel = bilinear_sample_hue_shift(
+                        let pixel = reconstruction_sample_hue_shift::<SAMPLING_MODE>(
                             source, raw_x[i], raw_y[i], source_width, source_height, hue_shift_degrees,
                         );
                         buff[base_idx..base_idx + 4].copy_from_slice(&pixel);

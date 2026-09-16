@@ -13,7 +13,7 @@ pub struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
     bind_group_layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::ComputePipeline,
+    pipelines: Vec<wgpu::ComputePipeline>,
 
     settings_buffer: wgpu::Buffer,
 
@@ -38,6 +38,7 @@ pub(crate) struct SourceImageGpu {
     tile_grid_width: u32,
     tile_grid_height: u32,
     layer_count: u32,
+    mip_level_count: u32,
 }
 
 impl SourceImageGpu {
@@ -135,14 +136,20 @@ impl GpuBackend {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("kaleidomo.compute_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let pipelines = (0..30).map(|variant| {
+            let mode = variant / 10;
+            let derivative = (variant / 5) % 2;
+            let anisotropy = [1, 2, 4, 8, 16][variant % 5];
+            let constants = [("reconstruction_mode", mode as f64), ("derivative_mipmapping", derivative as f64), ("anisotropy_level", anisotropy as f64)];
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(match mode { 0 => "kaleidomo.compute.nearest", 1 => "kaleidomo.compute.bilinear", _ => "kaleidomo.compute.bicubic" }),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
+                cache: None,
+            })
+        }).collect();
 
         let settings_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kaleidomo.persistent_settings_buffer"),
@@ -157,7 +164,7 @@ impl GpuBackend {
             device,
             queue,
             bind_group_layout,
-            pipeline,
+            pipelines,
             settings_buffer,
             source: None,
             output: None,
@@ -201,6 +208,7 @@ impl GpuBackend {
             );
         }
 
+        let mip_level_count = tile_size.ilog2() + 1;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("kaleidomo.input_texture_array"),
             size: wgpu::Extent3d {
@@ -208,7 +216,7 @@ impl GpuBackend {
                 height: tile_size,
                 depth_or_array_layers: layer_count,
             },
-            mip_level_count: 1,
+            mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
@@ -216,21 +224,28 @@ impl GpuBackend {
             view_formats: &[],
         });
 
-        let src_raw = rgba.as_raw();
-        let src_row_bytes = width as usize * 4;
-        let tile_row_bytes = tile_size as usize * 4;
+        for mip_level in 0..mip_level_count {
+            let scale = 1u32 << mip_level;
+            let mip_width = width.div_ceil(scale).max(1);
+            let mip_height = height.div_ceil(scale).max(1);
+            let mip_tile_size = (tile_size >> mip_level).max(1);
+            // Resize the complete source before slicing it into array layers.
+            // This preserves filtering across tile boundaries at every mip.
+            let mip = image::imageops::resize(&rgba, mip_width, mip_height, image::imageops::FilterType::Triangle);
+            let src_raw = mip.as_raw();
+            let src_row_bytes = mip_width as usize * 4;
+            let tile_row_bytes = mip_tile_size as usize * 4;
+            let mut tile_staging = vec![0u8; tile_row_bytes * mip_tile_size as usize];
 
-        let mut tile_staging = vec![0u8; tile_row_bytes * tile_size as usize];
-
-        for tile_y in 0..tile_grid_height {
-            for tile_x in 0..tile_grid_width {
+            for tile_y in 0..tile_grid_height {
+              for tile_x in 0..tile_grid_width {
                 tile_staging.fill(0);
 
-                let src_x = tile_x * tile_size;
-                let src_y = tile_y * tile_size;
+                let src_x = tile_x * mip_tile_size;
+                let src_y = tile_y * mip_tile_size;
 
-                let copy_width = (width - src_x).min(tile_size);
-                let copy_height = (height - src_y).min(tile_size);
+                let copy_width = mip_width.saturating_sub(src_x).min(mip_tile_size);
+                let copy_height = mip_height.saturating_sub(src_y).min(mip_tile_size);
 
                 for row in 0..copy_height as usize {
                     let src_start =
@@ -248,7 +263,7 @@ impl GpuBackend {
                 self.queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture,
-                        mip_level: 0,
+                        mip_level,
                         origin: wgpu::Origin3d {
                             x: 0,
                             y: 0,
@@ -259,15 +274,16 @@ impl GpuBackend {
                     &tile_staging,
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(tile_size * 4),
-                        rows_per_image: Some(tile_size),
+                        bytes_per_row: Some(mip_tile_size * 4),
+                        rows_per_image: Some(mip_tile_size),
                     },
                     wgpu::Extent3d {
-                        width: tile_size,
-                        height: tile_size,
+                        width: mip_tile_size,
+                        height: mip_tile_size,
                         depth_or_array_layers: 1,
                     },
                 );
+              }
             }
         }
 
@@ -278,7 +294,7 @@ impl GpuBackend {
             usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
             aspect: wgpu::TextureAspect::All,
             base_mip_level: 0,
-            mip_level_count: Some(1),
+            mip_level_count: Some(mip_level_count),
             base_array_layer: 0,
             array_layer_count: Some(layer_count),
         });
@@ -292,6 +308,7 @@ impl GpuBackend {
             tile_grid_width,
             tile_grid_height,
             layer_count,
+            mip_level_count,
         });
 
         self.last_settings = None;
@@ -433,7 +450,7 @@ impl GpuBackend {
                         timestamp_writes: None,
                     });
 
-                    pass.set_pipeline(&self.pipeline);
+                    pass.set_pipeline(self.pipeline(settings));
                     pass.set_bind_group(0, &bind_group, &[]);
                     pass.dispatch_workgroups(
                         tile_width.div_ceil(8),
@@ -642,6 +659,19 @@ fn non_zero_u64(value: u64) -> Result<NonZeroU64> {
     NonZeroU64::new(value).ok_or_else(|| anyhow!("value must be non-zero"))
 }
 
+#[cfg(test)]
+mod shader_tests {
+    #[test]
+    fn enhancement_shader_parses_and_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(include_str!("kaleidomo.wgsl"))
+            .expect("WGSL must parse");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        ).validate(&module).expect("WGSL must validate");
+    }
+}
+
 fn align_to(value: u32, alignment: u32) -> u32 {
     let rem = value % alignment;
     if rem == 0 {
@@ -769,8 +799,11 @@ impl GpuBackend {
         &self.queue
     }
 
-    pub(crate) fn pipeline(&self) -> &wgpu::ComputePipeline {
-        &self.pipeline
+    pub(crate) fn pipeline(&self, settings: &KaleidoSettings) -> &wgpu::ComputePipeline {
+        let mode = settings.anti_alias.min(2) as usize;
+        let derivative = settings.derivative_mipmapping as usize;
+        let anisotropy = match settings.anisotropy_level { 2 => 1, 4 => 2, 8 => 3, 16 => 4, _ => 0 };
+        &self.pipelines[mode * 10 + derivative * 5 + anisotropy]
     }
 
     pub(crate) fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
@@ -921,7 +954,9 @@ impl<'a> GpuVideoRenderer<'a> {
                 triangle_rotation_rad: 0.0,
                 kaleido_type: crate::KaleidoType::Radial,
                 hue_rotation: 0,
-                anti_alias: false,
+                anti_alias: 0,
+                derivative_mipmapping: true,
+                anisotropy_level: 1,
                 super_sample: 1,
                 aspect_correct: false,
             },
@@ -1038,7 +1073,7 @@ impl<'a> GpuVideoRenderer<'a> {
                 timestamp_writes: None,
             });
 
-            pass.set_pipeline(self.gpu.pipeline());
+            pass.set_pipeline(self.gpu.pipeline(settings));
             pass.set_bind_group(0, &slot.bind_group, &[]);
             pass.dispatch_workgroups(
                 self.width.div_ceil(8),
@@ -1288,14 +1323,20 @@ impl GpuBackend {
                 immediate_size: 0,
             });
  
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("kaleidomo.compute_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let pipelines = (0..30).map(|variant| {
+            let mode = variant / 10;
+            let derivative = (variant / 5) % 2;
+            let anisotropy = [1, 2, 4, 8, 16][variant % 5];
+            let constants = [("reconstruction_mode", mode as f64), ("derivative_mipmapping", derivative as f64), ("anisotropy_level", anisotropy as f64)];
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(match mode { 0 => "kaleidomo.canvas.nearest", 1 => "kaleidomo.canvas.bilinear", _ => "kaleidomo.canvas.bicubic" }),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
+                cache: None,
+            })
+        }).collect();
  
         let settings_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kaleidomo.settings_buffer"),
@@ -1418,7 +1459,7 @@ impl GpuBackend {
             device,
             queue,
             bind_group_layout,
-            pipeline,
+            pipelines,
             settings_buffer,
             source:               None,
             output:               None,
@@ -1560,7 +1601,7 @@ impl GpuBackend {
                 label: Some("kaleidomo.canvas_compute_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(self.pipeline(settings));
             pass.set_bind_group(0, &compute_bind_group, &[]);
             pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
         }

@@ -551,7 +551,9 @@ impl LiveKaleidoscopeEngine {
             hue_rotation: 0,
             // Enhancements default disabled until `start_animation()`/`update_animation_settings()`
             // supply real values from the JS side.
-            anti_alias: false,
+            anti_alias: 0,
+            derivative_mipmapping: true,
+            anisotropy_level: 1,
             super_sample: 1,
             aspect_correct: false,
         };
@@ -664,7 +666,7 @@ impl LiveKaleidoscopeEngine {
         kaleido_type_idx: u32,
         hue_rotation: u32,
         video_settings: &WasmVideoSettings,
-        anti_alias: bool,
+        anti_alias: u8,
         super_sample: u8,
         aspect_correct: bool,
     ) -> Result<(), JsValue> {
@@ -790,7 +792,7 @@ impl LiveKaleidoscopeEngine {
         hue_rotation: u32,
         video_settings: &WasmVideoSettings,
         frame: u32,
-        anti_alias: bool,
+        anti_alias: u8,
         super_sample: u8,
         aspect_correct: bool,
     ) -> Result<(), JsValue> {
@@ -841,7 +843,7 @@ impl LiveKaleidoscopeEngine {
         kaleido_type_idx: u32,
         hue_rotation: u32,
         video_settings: &WasmVideoSettings,
-        anti_alias: bool,
+        anti_alias: u8,
         super_sample: u8,
         aspect_correct: bool,
     ) -> Result<(), JsValue> {

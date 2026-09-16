@@ -37,6 +37,25 @@ pub(crate) fn bilinear_sample(source: &DynamicImage, sx: f32, sy: f32, sw: u32, 
     out
 }
 
+#[inline]
+fn cubic(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    0.5 * ((2.0 * p1) + (-p0 + p2) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t * t * t)
+}
+
+pub(crate) fn bicubic_sample(source: &DynamicImage, sx: f32, sy: f32, sw: u32, sh: u32) -> [u8; 4] {
+    if sw == 0 || sh == 0 { return [0; 4]; }
+    let bx = sx.floor() as i32; let by = sy.floor() as i32;
+    let fx = sx - sx.floor(); let fy = sy - sy.floor();
+    let mut rows = [[0.0f32; 4]; 4];
+    for row in 0..4 { let yy = (by + row as i32 - 1).clamp(0, sh as i32 - 1) as u32; let mut p = [[0u8; 4]; 4]; for col in 0..4 { let xx = (bx + col as i32 - 1).clamp(0, sw as i32 - 1) as u32; p[col] = source.get_pixel(xx, yy).0; } for channel in 0..4 { rows[row][channel] = cubic(p[0][channel] as f32, p[1][channel] as f32, p[2][channel] as f32, p[3][channel] as f32, fx); } }
+    let mut out = [0u8; 4]; for channel in 0..4 { out[channel] = cubic(rows[0][channel], rows[1][channel], rows[2][channel], rows[3][channel], fy).round().clamp(0.0, 255.0) as u8; } out
+}
+
+#[inline]
+pub(crate) fn reconstruction_sample<const MODE: u8>(source: &DynamicImage, sx: f32, sy: f32, sw: u32, sh: u32) -> [u8; 4] {
+    if MODE == 2 { bicubic_sample(source, sx, sy, sw, sh) } else { bilinear_sample(source, sx, sy, sw, sh) }
+}
+
 /// Same as [`bilinear_sample`], but also applies an HSV hue rotation to the
 /// blended pixel. Used by the `anti_alias` path when `hue_rotation != 0`; the
 /// fast SIMD/integer hue-shift path (`store_pixel_hue_shift`) is used when
@@ -58,6 +77,14 @@ pub(crate) fn bilinear_sample_hue_shift(
     let h = (h + hue_shift_degrees).rem_euclid(360.0);
     let (r2, g2, b2) = hsv_to_rgb_scalar(h, s, v);
     [r2, g2, b2, a]
+}
+
+#[inline]
+pub(crate) fn reconstruction_sample_hue_shift<const MODE: u8>(source: &DynamicImage, sx: f32, sy: f32, sw: u32, sh: u32, hue: f32) -> [u8; 4] {
+    let [r, g, b, a] = reconstruction_sample::<MODE>(source, sx, sy, sw, sh);
+    let (h, s, v) = rgb_to_hsv_scalar(r, g, b);
+    let (r, g, b) = hsv_to_rgb_scalar((h + hue).rem_euclid(360.0), s, v);
+    [r, g, b, a]
 }
 
 /// Plain-scalar RGB→HSV conversion (0-255 RGB in, degrees/0-1/0-1 HSV out).
@@ -129,16 +156,7 @@ pub mod avx2;
 ))]
 pub mod sse2;
 
-#[cfg(
-    any(
-        all(
-            not(any(target_arch = "aarch64", target_arch = "wasm32")), 
-            all(not(target_arch = "wasm32"), test)
-        ),
-        feature = "soft_backend",
-        any(target_arch = "x86_64", target_arch = "x86")
-    )
-)]
+#[cfg(not(target_arch = "wasm32"))]
 mod scalar;
 
 pub mod gpu;
@@ -157,6 +175,8 @@ pub trait KaleidoBackend: Sized + Copy {
     unsafe fn load_with_single_f32(input: f32) -> Self;
     /// Loads coordinates into a register, loading NUM_FLOATS pairs.
     unsafe fn load_coords(x: u32, y: u32) -> (Self, Self);
+    /// Writes register lanes to `output` for derivative-aware texture gathers.
+    unsafe fn write_lanes(self, output: &mut [f32]);
     /// Normalizes coordinates relative to the center.
     unsafe fn normalize_coords(&mut self, center: Self);
     /// Multiplies every lane by `factor`. Used for `aspect_correct`: scaling
@@ -180,7 +200,7 @@ pub trait KaleidoBackend: Sized + Copy {
     /// Stores pixels into the output buffer from the source image, given the computed source coordinates.
     /// When `bilinear` is `true` (the `anti_alias` setting), samples are blended between the four
     /// nearest source texels instead of rounding to the nearest one.
-    unsafe fn store_pixel(
+    unsafe fn store_pixel<const SAMPLING_MODE: u8>(
         output: &mut [u8],
         x: u32,
         sx: Self,
@@ -188,7 +208,6 @@ pub trait KaleidoBackend: Sized + Copy {
         source: &DynamicImage,
         sw: u32,
         sh: u32,
-        bilinear: bool,
     );
 
     /// Folds the coordinates for square kaleidoscope.
@@ -336,7 +355,7 @@ pub trait DaydreamBackend: KaleidoBackend {
     /// When `bilinear` is `true` (the `anti_alias` setting), the source sample is blended between the
     /// four nearest texels (via the shared scalar `bilinear_sample_hue_shift` helper) before the hue
     /// shift is applied, instead of using the fast SIMD nearest-neighbor + hue-shift path.
-    unsafe fn store_pixel_hue_shift(buff: &mut [u8], x: u32, sx: Self, sy: Self, source: &DynamicImage, source_width: u32, source_height: u32, hue_shift_vec: Self, two_fifty_five: Self, hundred: Self, zero: Self, six: Self, sixty: Self, one: Self, two: Self, four: Self, three_sixty: Self, five: Self, three: Self, bilinear: bool);
+    unsafe fn store_pixel_hue_shift<const SAMPLING_MODE: u8>(buff: &mut [u8], x: u32, sx: Self, sy: Self, source: &DynamicImage, source_width: u32, source_height: u32, hue_shift_vec: Self, two_fifty_five: Self, hundred: Self, zero: Self, six: Self, sixty: Self, one: Self, two: Self, four: Self, three_sixty: Self, five: Self, three: Self);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -347,7 +366,7 @@ pub type Register = core::arch::x86_64::__m256;
 pub type Register = f32;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn inner_loop<B: KaleidoBackend + DaydreamBackend>(
+pub fn inner_loop<B: KaleidoBackend + DaydreamBackend, const SAMPLING_MODE: u8>(
     y: usize,
     row: &mut [u8],
     zoom: f32,
@@ -395,11 +414,22 @@ pub fn inner_loop<B: KaleidoBackend + DaydreamBackend>(
         let aspect_ratio = B::load_with_single_f32(
             settings.output_size_w as f32 / settings.output_size_h.max(1) as f32,
         );
-        let anti_alias = settings.anti_alias;
 
-        row.chunks_exact_mut(B::NUM_FLOATS * size_of::<f32>())
+        let batch_bytes = B::NUM_FLOATS * size_of::<f32>();
+        row.chunks_mut(batch_bytes)
             .enumerate()
-            .for_each(|(x, buff)| {
+            .for_each(|(x, output)| {
+                // SIMD stores operate on a complete register. Render a final
+                // partial batch into stack storage, then copy only its active
+                // lanes so arbitrary output widths do not leave black pixels.
+                let output_len = output.len();
+                let output_ptr = output.as_mut_ptr();
+                let mut tail = [0u8; 32];
+                let buff: &mut [u8] = if output_len == batch_bytes {
+                    output
+                } else {
+                    &mut tail[..batch_bytes]
+                };
                 let x = x as u32 * B::NUM_FLOATS as u32;
                 let (mut dx, mut dy) = B::load_coords(x as u32, y as u32);
                 dx.normalize_coords(center_x);
@@ -473,12 +503,74 @@ pub fn inner_loop<B: KaleidoBackend + DaydreamBackend>(
 
                 //B::store_pixel_rgba8(buff, sx, sy, source.as_bytes(), source_width, source_height);
                 if hue_shift != 0 {
-                    B::store_pixel_hue_shift(buff, x, sx, sy, source, source_width, source_height, hue_shift_vec, two_fifty_five, hundred, zero, six, sixty, one, two, four, three_sixty, five, three, anti_alias);
+                    B::store_pixel_hue_shift::<SAMPLING_MODE>(buff, x, sx, sy, source, source_width, source_height, hue_shift_vec, two_fifty_five, hundred, zero, six, sixty, one, two, four, three_sixty, five, three);
                 } else {
-                    B::store_pixel(buff, x, sx, sy, source, source_width, source_height, anti_alias);
+                    B::store_pixel::<SAMPLING_MODE>(buff, x, sx, sy, source, source_width, source_height);
+                }
+                if output_len != batch_bytes {
+                    core::ptr::copy_nonoverlapping(buff.as_ptr(), output_ptr, output_len);
                 }
             });
         }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn map_batch<B: KaleidoBackend>(x: u32, y: u32, settings: &KaleidoSettings) -> (B, B) {
+    unsafe {
+        let (mut dx, mut dy) = B::load_coords(x, y);
+        let center_x = B::load_with_single_f32(settings.output_size_w as f32 * 0.5 + settings.offset_x as f32);
+        let center_y = B::load_with_single_f32(settings.output_size_h as f32 * 0.5 + settings.offset_y as f32);
+        dx.normalize_coords(center_x); dy.normalize_coords(center_y);
+        if settings.aspect_correct { dy = dy.scale(B::load_with_single_f32(settings.output_size_w as f32 / settings.output_size_h.max(1) as f32)); }
+        let half = B::load_with_single_f32(settings.output_size_w as f32 * 0.5);
+        let slice = B::load_with_single_f32(2.0 * core::f32::consts::PI / settings.count.max(1) as f32);
+        let two_pi = B::load_with_single_f32(2.0 * core::f32::consts::PI);
+        let tile = B::load_with_single_f32(settings.tile_count);
+        let zoom = B::load_with_single_f32(settings.zoom);
+        let rotation = B::load_with_single_f32(settings.triangle_rotation_rad);
+        let tx = B::load_with_single_f32(settings.triangle_center_x);
+        let ty = B::load_with_single_f32(settings.triangle_center_y);
+        match settings.kaleido_type {
+            KaleidoType::Radial => { let (r, theta) = B::map_to_polar(dx, dy, settings.zoom); let angle = B::compute_angle(theta, slice, settings.triangle_rotation_rad); B::compute_source_pixel_coords(angle, r, tx, ty) }
+            KaleidoType::Square => B::map_square(dx, dy, half, slice, two_pi, tile, zoom, rotation, tx, ty),
+            KaleidoType::Diamond => B::map_diamond(dx, dy, half, slice, two_pi, tile, zoom, rotation, tx, ty),
+            KaleidoType::Hexagonal => B::map_hexagonal(dx, dy, half, slice, two_pi, tile, zoom, rotation, tx, ty, B::load_with_single_f32(3.0f32.sqrt())),
+            KaleidoType::HexagonalFlatTop => B::map_hexagonal_flat_top(dx, dy, half, slice, two_pi, tile, zoom, rotation, tx, ty, B::load_with_single_f32(3.0f32.sqrt())),
+        }
+    }
+}
+
+/// Derivative-aware SIMD row loop. Coordinate warping remains vectorized; only
+/// the data-dependent texture gathers are resolved per lane from the shared mip pyramid.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn inner_loop_enhanced<B: KaleidoBackend + DaydreamBackend>(
+    y: usize,
+    row: &mut [u8],
+    settings: &KaleidoSettings,
+    pyramid: &crate::enhancement::CpuMipPyramid,
+    pipeline: &crate::enhancement::EnhancementPipeline,
+    hue_rotation: u32,
+) {
+    unsafe {
+        let (source_width, source_height) = pyramid.dimensions();
+        let tolerance = match settings.anti_alias { 0 => 0.0, 2 => 2.0, _ => 1.0 };
+        row.chunks_mut(B::NUM_FLOATS * 4).enumerate().for_each(|(batch, output)| {
+            let x = batch as u32 * B::NUM_FLOATS as u32;
+            let (sx, sy) = map_batch::<B>(x, y as u32, settings);
+            let (sx_dx, sy_dx) = map_batch::<B>(x + 1, y as u32, settings);
+            let (sx_dy, sy_dy) = map_batch::<B>(x, y as u32 + 1, settings);
+            let (mut xs, mut ys, mut xdx, mut ydx, mut xdy, mut ydy) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8], [0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
+            sx.write_lanes(&mut xs); sy.write_lanes(&mut ys); sx_dx.write_lanes(&mut xdx); sy_dx.write_lanes(&mut ydx); sx_dy.write_lanes(&mut xdy); sy_dy.write_lanes(&mut ydy);
+            let active_lanes = output.len() / 4;
+            for lane in 0..active_lanes {
+                if xs[lane] < -tolerance || ys[lane] < -tolerance || xs[lane] >= source_width as f32 + tolerance || ys[lane] >= source_height as f32 + tolerance { continue; }
+                let derivatives = crate::enhancement::UvDerivatives { dx: [xdx[lane] - xs[lane], ydx[lane] - ys[lane]], dy: [xdy[lane] - xs[lane], ydy[lane] - ys[lane]] };
+                let sampled = pyramid.sample(pipeline, [xs[lane], ys[lane]], derivatives);
+                let color = crate::enhancement::rotate_hue_rgba(sampled, hue_rotation as f32);
+                output[lane * 4..lane * 4 + 4].copy_from_slice(&color);
+            }
+        });
+    }
 }
 
 #[cfg(test)]

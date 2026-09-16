@@ -16,9 +16,9 @@ pub use pollster;
 
 pub use software_licensor_static_rust_lib::{LicenseData, lib_api::LicenseStatus, lib_api::{get_machine_stats_for_display, StatsDisplay}};
 pub use software_licensor_static_rust_lib;
-use crate::{KaleidoSettings, VideoSettings, modulate};
+use crate::{KaleidoSettings, KaleidoType, VideoSettings, modulate};
 use crate::backends::gpu::{GpuBackend, GpuVideoRenderer};
-pub use crate::backends::{KaleidoBackend, DaydreamBackend, Register, inner_loop};
+pub use crate::backends::{KaleidoBackend, DaydreamBackend, Register, inner_loop, inner_loop_enhanced};
 
 pub fn render_kaleidoscope(
     source: &DynamicImage,
@@ -170,12 +170,23 @@ fn render_kaleidoscope_with_backend_inner<B: KaleidoBackend + DaydreamBackend>(
     // Create a flat vector for the pixels
     let mut pixels = vec![0u8; (settings.output_size_w * settings.output_size_h * 4) as usize];
 
+    if settings.derivative_mipmapping || settings.anisotropy_level > 1 {
+        let pyramid = crate::enhancement::CpuMipPyramid::new(source);
+        let pipeline = sampling_pipeline(settings);
+        pixels
+            .par_chunks_exact_mut((settings.output_size_w * 4) as usize)
+            .enumerate()
+            .for_each(|(y, row)| inner_loop_enhanced::<B>(y, row, settings, &pyramid, &pipeline, settings.hue_rotation));
+        return ImageBuffer::from_raw(settings.output_size_w, settings.output_size_h, pixels).unwrap();
+    }
+
     // Rayon parallelizes the rows automatically
-    pixels
+    macro_rules! render_mode {
+        ($mode:expr) => { pixels
         .par_chunks_exact_mut((settings.output_size_w * 4) as usize)
         .enumerate()
         .for_each(|(y, row)| {
-            inner_loop::<B>(
+            inner_loop::<B, $mode>(
             //inner_loop::<f32>(
                 y,
                 row,
@@ -190,9 +201,64 @@ fn render_kaleidoscope_with_backend_inner<B: KaleidoBackend + DaydreamBackend>(
                 sh,
                 settings.hue_rotation,
             );
-        });
+        }) };
+    }
+    match settings.anti_alias { 0 => render_mode!(0), 2 => render_mode!(2), _ => render_mode!(1) };
 
     ImageBuffer::from_raw(settings.output_size_w, settings.output_size_h, pixels).unwrap()
+}
+
+fn sampling_pipeline(settings: &KaleidoSettings) -> crate::enhancement::EnhancementPipeline {
+    crate::enhancement::EnhancementPipeline::new(crate::enhancement::EnhancementConfig {
+        reconstruction: match settings.anti_alias { 0 => crate::enhancement::ReconstructionFilter::Nearest, 2 => crate::enhancement::ReconstructionFilter::Bicubic, _ => crate::enhancement::ReconstructionFilter::Bilinear },
+        explicit_derivatives: settings.derivative_mipmapping,
+        anisotropy: settings.anisotropy_level,
+        edge_filter: crate::enhancement::EdgeFilter::Disabled,
+        taa_enabled: false,
+        taa_feedback: 0.0,
+    })
+}
+
+/// Readable derivative-aware scalar reference used to verify SIMD/GPU output.
+/// It evaluates the nonlinear warp at the pixel and its two forward neighbors,
+/// so fold discontinuities produce the correct explicit texture footprint.
+pub fn render_kaleidoscope_scalar_enhanced(source: &DynamicImage, settings: &KaleidoSettings) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+    let pyramid = crate::enhancement::CpuMipPyramid::new(source);
+    let pipeline = sampling_pipeline(settings);
+    let mut pixels = vec![0u8; (settings.output_size_w * settings.output_size_h * 4) as usize];
+    pixels.par_chunks_exact_mut((settings.output_size_w * 4) as usize).enumerate().for_each(|(y, row)| {
+        for x in 0..settings.output_size_w as usize {
+            let p = map_scalar_coordinate(x as f32, y as f32, settings);
+            let px = map_scalar_coordinate((x + 1).min(settings.output_size_w as usize - 1) as f32, y as f32, settings);
+            let py = map_scalar_coordinate(x as f32, (y + 1).min(settings.output_size_h as usize - 1) as f32, settings);
+            let tolerance = match settings.anti_alias { 0 => 0.0, 2 => 2.0, _ => 1.0 };
+            if p.0 < -tolerance || p.1 < -tolerance || p.0 >= source.width() as f32 + tolerance || p.1 >= source.height() as f32 + tolerance { continue; }
+            let derivatives = crate::enhancement::UvDerivatives { dx: [px.0 - p.0, px.1 - p.1], dy: [py.0 - p.0, py.1 - p.1] };
+            let sampled = pyramid.sample(&pipeline, [p.0, p.1], derivatives);
+            let color = crate::enhancement::rotate_hue_rgba(sampled, settings.hue_rotation as f32);
+            row[x * 4..x * 4 + 4].copy_from_slice(&color);
+        }
+    });
+    ImageBuffer::from_raw(settings.output_size_w, settings.output_size_h, pixels).expect("scalar output dimensions validated")
+}
+
+fn map_scalar_coordinate(x: f32, y: f32, settings: &KaleidoSettings) -> (f32, f32) {
+    unsafe {
+        let center_x = settings.output_size_w as f32 * 0.5 + settings.offset_x as f32;
+        let center_y = settings.output_size_h as f32 * 0.5 + settings.offset_y as f32;
+        let dx = x - center_x;
+        let mut dy = y - center_y;
+        if settings.aspect_correct { dy *= settings.output_size_w as f32 / settings.output_size_h.max(1) as f32; }
+        let half = settings.output_size_w as f32 * 0.5;
+        let slice = 2.0 * PI / settings.count.max(1) as f32;
+        match settings.kaleido_type {
+            KaleidoType::Radial => { let (r, theta) = <f32 as KaleidoBackend>::map_to_polar(dx, dy, settings.zoom); let angle = <f32 as KaleidoBackend>::compute_angle(theta, slice, settings.triangle_rotation_rad); <f32 as KaleidoBackend>::compute_source_pixel_coords(angle, r, settings.triangle_center_x, settings.triangle_center_y) }
+            KaleidoType::Square => <f32 as KaleidoBackend>::map_square(dx, dy, half, slice, 2.0*PI, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y),
+            KaleidoType::Diamond => <f32 as KaleidoBackend>::map_diamond(dx, dy, half, slice, 2.0*PI, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y),
+            KaleidoType::Hexagonal => <f32 as KaleidoBackend>::map_hexagonal(dx, dy, half, slice, 2.0*PI, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y, 3.0f32.sqrt()),
+            KaleidoType::HexagonalFlatTop => <f32 as KaleidoBackend>::map_hexagonal_flat_top(dx, dy, half, slice, 2.0*PI, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y, 3.0f32.sqrt()),
+        }
+    }
 }
 
 /// Box-downsamples an RGBA8 buffer of size `(src_w, src_h)` by an integer `factor`
@@ -497,6 +563,8 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
 
     let mut rgba = vec![0u8; (render_w * render_h * 4) as usize];
     let mut final_rgba = vec![0u8; (out_w * out_h * 4) as usize];
+    let enhanced_sampling = (settings.derivative_mipmapping || settings.anisotropy_level > 1)
+        .then(|| (crate::enhancement::CpuMipPyramid::new(source), sampling_pipeline(&settings)));
 
     //let triangle_rotation_delta = degrees_to_radians(video_settings.triangle_rotation_degrees_per_frame);
     // Owned copy of the most recently written frame, retained only so
@@ -526,11 +594,29 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
             &mut modulation_state,
         );
 
-        rgba
+        if let Some((pyramid, pipeline)) = &enhanced_sampling {
+            let frame_settings = if factor > 1 {
+                KaleidoSettings {
+                    output_size_w: render_w,
+                    output_size_h: render_h,
+                    offset_x: render_offset_x,
+                    offset_y: render_offset_y,
+                    ..settings.clone()
+                }
+            } else {
+                settings.clone()
+            };
+            rgba
+                .par_chunks_exact_mut((render_w * 4) as usize)
+                .enumerate()
+                .for_each(|(y, row)| inner_loop_enhanced::<B>(y, row, &frame_settings, pyramid, pipeline, hue_rotation));
+        } else {
+        macro_rules! render_video_mode {
+            ($mode:expr) => { rgba
             .par_chunks_exact_mut((render_w * 4) as usize)
             .enumerate()
             .for_each(|(y, row)| {
-                inner_loop::<B>(
+                inner_loop::<B, $mode>(
                     y,
                     row,
                     settings.zoom,
@@ -544,7 +630,10 @@ fn render_video<B: KaleidoBackend + DaydreamBackend>(
                     source.height(),
                     hue_rotation,
                 );
-            });
+            }) };
+        }
+        match settings.anti_alias { 0 => render_video_mode!(0), 2 => render_video_mode!(2), _ => render_video_mode!(1) };
+        }
 
         let frame_bytes: &[u8] = if factor > 1 {
             final_rgba = downsample_box(&rgba, render_w, render_h, factor, out_w, out_h);
@@ -866,76 +955,163 @@ pub fn render_video_gpu(
 
 #[cfg(test)]
 mod tests {
-    use crate::KaleidoType;
-
-use super::*;
+    use super::*;
     use image::{DynamicImage, RgbaImage};
+    use std::sync::Mutex;
+
+    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn gradient_source(width: u32, height: u32) -> DynamicImage {
+        let image = RgbaImage::from_fn(width, height, |x, y| {
+            let fx = x as f32 / width.saturating_sub(1).max(1) as f32;
+            let fy = y as f32 / height.saturating_sub(1).max(1) as f32;
+            Rgba([
+                (fx * 255.0).round() as u8,
+                (fy * 255.0).round() as u8,
+                ((0.65 * fx + 0.35 * fy) * 255.0).round() as u8,
+                255,
+            ])
+        });
+        DynamicImage::ImageRgba8(image)
+    }
+
+    fn settings_for(kaleido_type: KaleidoType, reconstruction: u8, derivatives: bool, anisotropy: u8, supersampling: u8, aspect_correct: bool) -> KaleidoSettings {
+        KaleidoSettings {
+            output_size_w: 67,
+            output_size_h: 53,
+            offset_x: 3,
+            offset_y: -2,
+            count: 7,
+            zoom: 1.35,
+            triangle_center_x: 48.0,
+            triangle_center_y: 39.0,
+            triangle_rotation_rad: 0.37,
+            kaleido_type,
+            tile_count: 4.5,
+            hue_rotation: 23,
+            anti_alias: reconstruction,
+            derivative_mipmapping: derivatives,
+            anisotropy_level: anisotropy,
+            super_sample: supersampling,
+            aspect_correct,
+        }
+    }
+
+    fn assert_images_close(label: &str, reference: &RgbaImage, actual: &RgbaImage, channel_tolerance: u8, max_bad_pixel_ratio: f32) {
+        assert_eq!(reference.dimensions(), actual.dimensions(), "{label}: output dimensions differ");
+        let mut bad_pixels = 0usize;
+        let mut worst_delta = 0u8;
+        let mut absolute_error = 0u64;
+        for (expected, observed) in reference.pixels().zip(actual.pixels()) {
+            let mut pixel_bad = false;
+            for channel in 0..4 {
+                let delta = expected[channel].abs_diff(observed[channel]);
+                worst_delta = worst_delta.max(delta);
+                absolute_error += delta as u64;
+                pixel_bad |= delta > channel_tolerance;
+            }
+            bad_pixels += pixel_bad as usize;
+        }
+        let pixels = (reference.width() * reference.height()) as usize;
+        let bad_ratio = bad_pixels as f32 / pixels as f32;
+        let mean_error = absolute_error as f32 / (pixels * 4) as f32;
+        assert!(bad_ratio <= max_bad_pixel_ratio,
+            "{label}: {bad_pixels}/{pixels} pixels ({:.3}%) exceeded channel tolerance {channel_tolerance}; worst delta {worst_delta}, mean absolute error {mean_error:.3}",
+            bad_ratio * 100.0);
+    }
+
+    fn assert_backend_matches_scalar<B: KaleidoBackend + DaydreamBackend>(label: &str, source: &DynamicImage, settings: &KaleidoSettings) {
+        let scalar = render_kaleidoscope_with_backend::<f32>(source, settings.clone());
+        let backend = render_kaleidoscope_with_backend::<B>(source, settings.clone());
+        assert_images_close(label, &scalar, &backend, 3, 0.02);
+    }
+
+    macro_rules! backend_parity_case {
+        ($module:ident, $settings:expr) => {
+            mod $module {
+                use super::*;
+
+                fn fixture() -> (DynamicImage, KaleidoSettings) {
+                    (gradient_source(96, 80), $settings)
+                }
+
+                #[test]
+                fn gpu_matches_scalar_reference() {
+                    let _gpu_guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
+                    let (source, settings) = fixture();
+                    let scalar = render_kaleidoscope_with_backend::<f32>(&source, settings.clone());
+                    let Ok(gpu) = render_kaleidoscope_with_gpu(&source, settings) else {
+                        eprintln!("GPU parity skipped: no compatible adapter available");
+                        return;
+                    };
+                    assert_images_close("GPU vs scalar", &scalar, &gpu, 6, 0.05);
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                #[test]
+                fn avx2_matches_scalar_reference() {
+                    if !is_x86_feature_detected!("avx2") { return; }
+                    let (source, settings) = fixture();
+                    assert_backend_matches_scalar::<core::arch::x86_64::__m256>("AVX2 vs scalar", &source, &settings);
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                #[test]
+                fn sse2_matches_scalar_reference() {
+                    if !is_x86_feature_detected!("sse2") { return; }
+                    let (source, settings) = fixture();
+                    assert_backend_matches_scalar::<core::arch::x86_64::__m128>("SSE2 vs scalar", &source, &settings);
+                }
+
+                #[cfg(target_arch = "aarch64")]
+                #[test]
+                fn neon_matches_scalar_reference() {
+                    if !std::arch::is_aarch64_feature_detected!("neon") { return; }
+                    let (source, settings) = fixture();
+                    assert_backend_matches_scalar::<core::arch::aarch64::float32x4_t>("NEON vs scalar", &source, &settings);
+                }
+            }
+        };
+    }
+
+    backend_parity_case!(radial_nearest, {
+        let mut settings = settings_for(KaleidoType::Radial, 0, true, 1, 1, false);
+        settings.hue_rotation = 0;
+        settings
+    });
+    backend_parity_case!(square_bilinear_unmipped, {
+        let mut settings = settings_for(KaleidoType::Square, 1, false, 1, 1, true);
+        settings.hue_rotation = 0;
+        settings
+    });
+    backend_parity_case!(square_bilinear_mipped, settings_for(KaleidoType::Square, 1, true, 1, 1, true));
+    backend_parity_case!(diamond_bicubic_anisotropic, settings_for(KaleidoType::Diamond, 2, true, 4, 1, false));
+    backend_parity_case!(hexagonal_supersampled, settings_for(KaleidoType::Hexagonal, 1, true, 8, 2, true));
 
     #[test]
-    fn test_simd_vs_scalar_parity() {
-        // 1. Setup a dummy source image (e.g., a 100x100 gradient)
-        let sw = 100;
-        let sh = 100;
-        let mut source_pixels = Vec::new();
-        for y in 0..sh {
-            for x in 0..sw {
-                source_pixels.extend_from_slice(&[x as u8, y as u8, 128, 255]);
-            }
-        }
-        let source = DynamicImage::ImageRgba8(RgbaImage::from_raw(sw, sh, source_pixels).unwrap());
-
-        // 2. Setup Kaleidoscope settings
+    fn enhanced_simd_writes_trailing_pixels_for_odd_widths() {
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(128, 128, Rgba([24, 48, 96, 255])));
         let settings = KaleidoSettings {
-            output_size_w: 64, // Keep it small for fast tests
-            output_size_h: 64,
+            output_size_w: 67,
+            output_size_h: 5,
             offset_x: 0,
             offset_y: 0,
-            count: 6,        // Hexagonal symmetry
-            zoom: 1.0,
-            triangle_center_x: 50.0,
-            triangle_center_y: 50.0,
+            count: 6,
+            zoom: 10.0,
+            triangle_center_x: 64.0,
+            triangle_center_y: 64.0,
             triangle_rotation_rad: 0.0,
-            kaleido_type: KaleidoType::Hexagonal,
+            kaleido_type: KaleidoType::Radial,
             tile_count: 4.0,
             hue_rotation: 0,
-            anti_alias: false,
+            anti_alias: 1,
+            derivative_mipmapping: true,
+            anisotropy_level: 4,
             super_sample: 1,
             aspect_correct: false,
         };
 
-        // 3. Render using Scalar Backend
-        // Note: You may need to expose these functions or make them generic
-        // to call specific backends in the same test.
-        //let scalar_image = render_kaleidoscope_with_backend::<f32>(&source, settings.clone());
-        let scalar_image = render_kaleidoscope_with_backend::<f32>(&source, settings.clone());
-
-        // 4. Render using Aarch64 (Neon) Backend
-        let simd_image = render_kaleidoscope_with_gpu(&source, settings.clone()).unwrap();
-        //let simd_image = render_kaleidoscope_with_backend::<Register>(&source, settings.clone());
-
-        // 5. Compare pixels
-        let mut diff_count = 0;
-        let threshold = 1; // Allow for 1-bit rounding difference in color channels
-
-        for (p_scalar, p_simd) in scalar_image.pixels().zip(simd_image.pixels()) {
-            for i in 0..4 {
-                // Check R, G, B, A
-                let diff = (p_scalar[i] as i16 - p_simd[i] as i16).abs();
-                if diff > threshold {
-                    diff_count += 1;
-                }
-            }
-        }
-
-        let total_pixels = settings.output_size_h * settings.output_size_w;
-        let error_rate = diff_count as f32 / (total_pixels * 4) as f32;
-
-        // We allow a very small error rate due to float precision differences
-        // in trig approximations (Polynomial vs libm)
-        assert!(
-            error_rate < 0.001,
-            "Neon output diverged from Scalar! Error rate: {:.4}%",
-            error_rate * 100.0
-        );
+        let output = render_kaleidoscope_with_auto_backend(&source, settings);
+        assert!(output.pixels().all(|pixel| pixel.0 == [24, 48, 96, 255]));
     }
 }
