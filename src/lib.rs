@@ -4,6 +4,7 @@
 
 pub mod backends;
 pub mod enhancement;
+pub mod preprocess;
 #[cfg(not(target_arch = "wasm32"))]
 mod rlib;
 #[cfg(not(target_arch = "wasm32"))]
@@ -50,6 +51,14 @@ pub struct KaleidoSettings {
     pub triangle_rotation_rad: f32, // Rotation of the triangle in radians
     pub kaleido_type: KaleidoType,  // Type of kaleidoscope (radial, square, etc.)
     pub hue_rotation: u32, // Hue rotation in degrees (0-360)
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    pub recolor_enabled: bool,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    pub recolor_seed: String,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    pub recolor_mode: u8,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_recolor_threshold"))]
+    pub recolor_threshold: f32,
 
     // ── Enhancements (all default-disabled to preserve existing look/output) ──
     /// Enables bilinear texture filtering when sampling the source image,
@@ -93,6 +102,8 @@ fn default_super_sample() -> u8 {
 fn default_true() -> bool { true }
 #[cfg(not(target_arch = "wasm32"))]
 fn default_anisotropy() -> u8 { 1 }
+#[cfg(not(target_arch = "wasm32"))]
+fn default_recolor_threshold() -> f32 { 0.08 }
 
 pub struct VideoSettings {
     /// The duration of the animation

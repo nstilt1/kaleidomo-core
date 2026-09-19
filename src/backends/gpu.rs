@@ -725,6 +725,13 @@ pub struct GpuKaleidoSettings {
     /// WGSL uniform buffers.
     pub _pad1: u32,
     pub _pad2: u32,
+
+    pub recolor_offsets_0: [f32; 4],
+    pub recolor_offsets_1: [f32; 4],
+    pub recolor_threshold: f32,
+    pub recolor_enabled: u32,
+    pub recolor_mode: u32,
+    pub _pad4: u32,
 }
 
 impl GpuKaleidoSettings {
@@ -740,6 +747,13 @@ impl GpuKaleidoSettings {
         let slice_angle = (2.0 * std::f32::consts::PI) / safe_count as f32;
         let center_x = settings.output_size_w as f32 * 0.5 + settings.offset_x as f32;
         let center_y = settings.output_size_h as f32 * 0.5 + settings.offset_y as f32;
+        let recolor = crate::preprocess::params_from_seed(
+            settings.recolor_seed.as_bytes(),
+            settings.recolor_threshold,
+        ).unwrap_or(crate::preprocess::PreprocessParams {
+            hue_offsets: [0.0; crate::preprocess::HUE_BAND_COUNT],
+            threshold: 1.0,
+        });
 
         Self {
             count: settings.count,
@@ -776,6 +790,12 @@ impl GpuKaleidoSettings {
             aspect_correct: settings.aspect_correct as u32,
             _pad1: 0,
             _pad2: 0,
+            recolor_offsets_0: recolor.hue_offsets[0..4].try_into().unwrap(),
+            recolor_offsets_1: recolor.hue_offsets[4..8].try_into().unwrap(),
+            recolor_threshold: recolor.threshold,
+            recolor_enabled: settings.recolor_enabled as u32,
+            recolor_mode: settings.recolor_mode as u32,
+            _pad4: 0,
         }
     }
 }
@@ -954,6 +974,10 @@ impl<'a> GpuVideoRenderer<'a> {
                 triangle_rotation_rad: 0.0,
                 kaleido_type: crate::KaleidoType::Radial,
                 hue_rotation: 0,
+                recolor_enabled: false,
+                recolor_seed: String::new(),
+                recolor_mode: 0,
+                recolor_threshold: 0.08,
                 anti_alias: 0,
                 derivative_mipmapping: true,
                 anisotropy_level: 1,

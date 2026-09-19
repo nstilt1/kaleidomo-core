@@ -43,6 +43,13 @@ struct KaleidoSettings {
     aspect_correct: u32,
     _pad1: u32,
     _pad2: u32,
+
+    recolor_offsets_0: vec4<f32>,
+    recolor_offsets_1: vec4<f32>,
+    recolor_threshold: f32,
+    recolor_enabled: u32,
+    recolor_mode: u32,
+    _pad4: u32,
 };
 
 @group(0) @binding(0)
@@ -453,7 +460,7 @@ fn source_in_bounds(src_i: vec2<i32>) -> bool {
 fn apply_hue_rotation(rgb: vec3<f32>) -> vec3<f32> {
     var final_rgb = rgb;
 
-    if (settings.hue_rotation % 360 != 0u) {
+    if (settings.hue_rotation % 360 != 0u || settings.recolor_enabled != 0u) {
         let r = rgb.r;
         let g = rgb.g;
         let b = rgb.b;
@@ -480,7 +487,43 @@ fn apply_hue_rotation(rgb: vec3<f32>) -> vec3<f32> {
 
         let v = c_max;
 
-        h = euclidean_modulo(h + f32(settings.hue_rotation), 360.0);
+        var recolor_degrees = 0.0;
+        if (settings.recolor_enabled != 0u) {
+            let hue01 = euclidean_modulo(h, 360.0) / 360.0;
+            let offsets = array<f32, 8>(
+                settings.recolor_offsets_0.x, settings.recolor_offsets_0.y,
+                settings.recolor_offsets_0.z, settings.recolor_offsets_0.w,
+                settings.recolor_offsets_1.x, settings.recolor_offsets_1.y,
+                settings.recolor_offsets_1.z, settings.recolor_offsets_1.w,
+            );
+            let edge = min(settings.recolor_threshold + 0.08, 1.0);
+            var strength = smoothstep(settings.recolor_threshold, edge, s);
+            var offset = 0.0;
+            if (settings.recolor_mode == 1u) {
+                // Smaller bordered-cell mode: preserve dark outlines and use
+                // hue, saturation and value together to distinguish fills.
+                strength *= smoothstep(settings.recolor_threshold * 0.75, min(settings.recolor_threshold * 0.75 + 0.12, 1.0), v);
+                let hue_bin = u32(floor(hue01 * 8.0)) % 8u;
+                let sat_bin = u32(floor(clamp(s, 0.0, 0.999999) * 4.0));
+                let value_position = clamp(v, 0.0, 0.999999) * 4.0;
+                let value_bin = u32(floor(value_position));
+                let next_value = min(value_bin + 1u, 3u);
+                let a = (hue_bin + sat_bin * 5u + value_bin * 3u) % 8u;
+                let b = (hue_bin + sat_bin * 5u + next_value * 3u) % 8u;
+                let fraction = fract(value_position);
+                let blend = fraction * fraction * (3.0 - 2.0 * fraction);
+                offset = mix(offsets[a], offsets[b], blend);
+            } else {
+                let band_position = hue01 * 8.0;
+                let band = u32(floor(band_position)) % 8u;
+                let next_band = (band + 1u) % 8u;
+                let fraction = fract(band_position);
+                let blend = fraction * fraction * (3.0 - 2.0 * fraction);
+                offset = mix(offsets[band], offsets[next_band], blend);
+            }
+            recolor_degrees = offset * strength * 360.0;
+        }
+        h = euclidean_modulo(h + recolor_degrees + f32(settings.hue_rotation), 360.0);
         let h_sector = h / 60.0;
 
         let c = v * s;

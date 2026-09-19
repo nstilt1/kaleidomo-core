@@ -123,6 +123,29 @@ pub fn render_kaleidoscope_with_backend<B: KaleidoBackend + DaydreamBackend>(
     source: &DynamicImage,
     settings: KaleidoSettings,
 ) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+    let processed_source;
+    let source = if settings.recolor_enabled {
+        let mut rgba = source.to_rgba8();
+        // A finite threshold is guaranteed by the UI/wire validation. If a
+        // third-party caller supplies NaN, preserve the source rather than panic.
+        if crate::preprocess::preprocess_source_frame_with_mode(
+            &mut rgba,
+            settings.recolor_seed.as_bytes(),
+            settings.recolor_threshold,
+            if settings.recolor_mode == 1 {
+                crate::preprocess::RecolorMode::BorderedCells
+            } else {
+                crate::preprocess::RecolorMode::ColorBands
+            },
+        ).is_ok() {
+            processed_source = DynamicImage::ImageRgba8(rgba);
+            &processed_source
+        } else {
+            source
+        }
+    } else {
+        source
+    };
     let (src_w, src_h) = source.dimensions();
     let factor = crate::safe_super_sample(settings.super_sample, src_w, src_h);
     if factor > 1 {
@@ -989,6 +1012,10 @@ mod tests {
             kaleido_type,
             tile_count: 4.5,
             hue_rotation: 23,
+            recolor_enabled: false,
+            recolor_seed: String::new(),
+            recolor_mode: 0,
+            recolor_threshold: 0.08,
             anti_alias: reconstruction,
             derivative_mipmapping: derivatives,
             anisotropy_level: anisotropy,
@@ -1104,6 +1131,10 @@ mod tests {
             kaleido_type: KaleidoType::Radial,
             tile_count: 4.0,
             hue_rotation: 0,
+            recolor_enabled: false,
+            recolor_seed: String::new(),
+            recolor_mode: 0,
+            recolor_threshold: 0.08,
             anti_alias: 1,
             derivative_mipmapping: true,
             anisotropy_level: 4,
