@@ -10,6 +10,8 @@ use wgpu::util::DeviceExt;
 use crate::{KaleidoSettings, KaleidoType};
 
 pub struct GpuBackend {
+    #[cfg(not(target_arch = "wasm32"))]
+    instance: Option<wgpu::Instance>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -163,6 +165,7 @@ impl GpuBackend {
         info!("GpuBackend initialized successfully");
 
         Ok(Self {
+            instance: Some(instance),
             device,
             queue,
             bind_group_layout,
@@ -1347,6 +1350,70 @@ struct CanvasIntermediate {
 }
  
 impl GpuBackend {
+    #[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
+    pub unsafe fn create_appkit_surface(
+        &self,
+        ns_view: std::ptr::NonNull<std::ffi::c_void>,
+    ) -> Result<wgpu::Surface<'static>> {
+        use raw_window_handle::{AppKitDisplayHandle, AppKitWindowHandle, RawDisplayHandle, RawWindowHandle};
+        let instance = self.instance.as_ref().context("native GPU instance unavailable")?;
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(RawDisplayHandle::AppKit(AppKitDisplayHandle::new())),
+            raw_window_handle: RawWindowHandle::AppKit(AppKitWindowHandle::new(ns_view)),
+        };
+        unsafe { instance.create_surface_unsafe(target) }
+            .context("failed to create Metal surface for native preview view")
+    }
+
+    pub fn prepare_direct_surface(&mut self, swapchain_format: wgpu::TextureFormat) -> Result<()> {
+        if self.blit_pipeline.is_some() { return Ok(()); }
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kaleidomo.native_blit_shader"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                @group(0) @binding(0) var image: texture_2d<f32>;
+                @group(0) @binding(1) var image_sampler: sampler;
+                struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }
+                @vertex fn vs_main(@builtin(vertex_index) i: u32) -> Out {
+                    var o: Out;
+                    let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
+                    let y = f32(i & 2u) * 2.0 - 1.0;
+                    o.position = vec4<f32>(x, y, 0.0, 1.0);
+                    o.uv = vec2<f32>((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+                    return o;
+                }
+                @fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
+                    return textureSample(image, image_sampler, in.uv);
+                }
+            "#.into()),
+        });
+        let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("kaleidomo.native_blit_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("kaleidomo.native_blit_pipeline_layout"), bind_group_layouts: &[Some(&layout)], immediate_size: 0,
+        });
+        self.blit_pipeline = Some(self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("kaleidomo.native_blit_pipeline"), layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState { format: swapchain_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default() }),
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+        }));
+        self.blit_bind_group_layout = Some(layout);
+        self.blit_sampler = Some(self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("kaleidomo.native_blit_sampler"), mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear, ..Default::default()
+        }));
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Constructor for the Wasm / canvas path.
     // Call this instead of GpuBackend::new() when you already have a
@@ -1542,6 +1609,8 @@ impl GpuBackend {
         info!("GpuBackend (canvas) initialized successfully");
  
         Ok(Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            instance: None,
             device,
             queue,
             bind_group_layout,
@@ -1721,5 +1790,15 @@ impl GpuBackend {
  
         self.queue.submit(Some(encoder.finish()));
         Ok(())
+    }
+
+    pub fn render_directly_to_view_with_internal_uniform(
+        &mut self,
+        settings: &KaleidoSettings,
+        swap_view: &wgpu::TextureView,
+        swapchain_format: wgpu::TextureFormat,
+    ) -> Result<()> {
+        let settings_buffer = self.settings_buffer.clone();
+        self.render_directly_to_view(settings, swap_view, &settings_buffer, swapchain_format)
     }
 }

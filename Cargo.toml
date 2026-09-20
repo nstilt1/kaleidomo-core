@@ -22,6 +22,7 @@ wgpu = { version = "29", default-features = false, features = ["std", "wgsl"] }
  
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon    = "1.10"
+raw-window-handle = "0.6"
 # openh264/minimp4 were removed: video encoding + MP4 muxing now happens via
 # the FFmpeg sidecar in src-tauri, which implements `VideoFrameSink`. See
 # kaleidomo-core/src/video_sink.rs.
