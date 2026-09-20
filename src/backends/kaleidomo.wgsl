@@ -1,4 +1,9 @@
 // kalidomo.wgsl
+// Specialized by WGPU into three cached pipelines; never changed dynamically
+// inside a dispatch (0 nearest, 1 bilinear, 2 Catmull-Rom bicubic).
+override reconstruction_mode: u32 = 0u;
+override derivative_mipmapping: u32 = 1u;
+override anisotropy_level: u32 = 1u;
 
 struct KaleidoSettings {
     count: u32,
@@ -30,6 +35,26 @@ struct KaleidoSettings {
     source_tile_grid_height: u32,
     output_tile_origin_x: u32,
     output_tile_origin_y: u32,
+
+    // ── Enhancements (see `KaleidoSettings` in lib.rs for full docs) ──
+    // `anti_alias`/`aspect_correct` are u32 (0/1) rather than bool for WGSL
+    // uniform-buffer layout compatibility with `GpuKaleidoSettings` in gpu.rs.
+    anti_alias: u32,
+    aspect_correct: u32,
+    _pad1: u32,
+    _pad2: u32,
+
+    recolor_offsets_0: vec4<f32>,
+    recolor_offsets_1: vec4<f32>,
+    recolor_threshold: f32,
+    recolor_enabled: u32,
+    recolor_mode: u32,
+    _pad4: u32,
+    recolor_seed_words: vec4<u32>,
+    recolor_cell_size: f32,
+    _pad5_0: u32,
+    _pad5_1: u32,
+    _pad5_2: u32,
 };
 
 @group(0) @binding(0)
@@ -68,6 +93,110 @@ fn load_source_pixel(src_i: vec2<i32>) -> vec4<f32> {
     let layer = i32(tile_y * settings.source_tile_grid_width + tile_x);
 
     return textureLoad(input_tex, vec2<i32>(local_x, local_y), layer, 0);
+}
+
+fn load_source_pixel_mip(src: vec2<f32>, level: u32) -> vec4<f32> {
+    let scale = f32(1u << level);
+    let base = vec2<i32>(floor(src));
+    let tile_size = i32(settings.source_tile_size);
+    let tile = vec2<u32>(u32(max(base.x, 0) / tile_size), u32(max(base.y, 0) / tile_size));
+    let layer = i32(tile.y * settings.source_tile_grid_width + tile.x);
+    let local_base = vec2<i32>(base.x % tile_size, base.y % tile_size);
+    return textureLoad(input_tex, vec2<i32>(floor(vec2<f32>(local_base) / scale)), layer, i32(level));
+}
+
+fn sample_bilinear_mip(src: vec2<f32>, level: u32) -> vec4<f32> {
+    let scale = f32(1u << level);
+    let mip_pos = src / scale;
+    let base = floor(mip_pos);
+    let fraction = fract(mip_pos);
+    let p00 = load_source_pixel_mip(base * scale, level);
+    let p10 = load_source_pixel_mip((base + vec2<f32>(1.0, 0.0)) * scale, level);
+    let p01 = load_source_pixel_mip((base + vec2<f32>(0.0, 1.0)) * scale, level);
+    let p11 = load_source_pixel_mip((base + vec2<f32>(1.0, 1.0)) * scale, level);
+    return mix(mix(p00, p10, fraction.x), mix(p01, p11, fraction.x), fraction.y);
+}
+
+// `anti_alias` path: bilinear-blends the four nearest texels around floating
+// point source coordinates `(sx, sy)` instead of rounding to the nearest one.
+// Mirrors the CPU backends' shared `bilinear_sample` helper in backends/mod.rs
+// so the two render paths produce visually consistent smoothing.
+fn load_source_pixel_bilinear(sx: f32, sy: f32) -> vec4<f32> {
+    let x0 = floor(sx);
+    let y0 = floor(sy);
+    let fx = sx - x0;
+    let fy = sy - y0;
+
+    let p00 = load_source_pixel(vec2<i32>(i32(x0), i32(y0)));
+    let p10 = load_source_pixel(vec2<i32>(i32(x0) + 1, i32(y0)));
+    let p01 = load_source_pixel(vec2<i32>(i32(x0), i32(y0) + 1));
+    let p11 = load_source_pixel(vec2<i32>(i32(x0) + 1, i32(y0) + 1));
+
+    let top = mix(p00, p10, fx);
+    let bottom = mix(p01, p11, fx);
+    return mix(top, bottom, fy);
+}
+
+fn catmull_rom_weights(t: f32) -> vec4<f32> {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    return vec4<f32>(
+        -0.5 * t + t2 - 0.5 * t3,
+        1.0 - 2.5 * t2 + 1.5 * t3,
+        0.5 * t + 2.0 * t2 - 1.5 * t3,
+        -0.5 * t2 + 0.5 * t3,
+    );
+}
+
+// Explicit 16-tap Catmull-Rom reconstruction. This deliberately uses
+// textureLoad so bicubic never falls through to a fixed-function sampler.
+fn load_source_pixel_bicubic(sx: f32, sy: f32) -> vec4<f32> {
+    let base = vec2<i32>(i32(floor(sx)), i32(floor(sy)));
+    let weights_x = catmull_rom_weights(fract(sx));
+    let weights_y = catmull_rom_weights(fract(sy));
+    var color = vec4<f32>(0.0);
+    for (var row = 0; row < 4; row += 1) {
+        var horizontal = vec4<f32>(0.0);
+        for (var column = 0; column < 4; column += 1) {
+            let coordinate = clamp(
+                base + vec2<i32>(column - 1, row - 1),
+                vec2<i32>(0),
+                vec2<i32>(i32(settings.source_width) - 1, i32(settings.source_height) - 1),
+            );
+            horizontal += load_source_pixel(coordinate) * weights_x[column];
+        }
+        color += horizontal * weights_y[row];
+    }
+    return clamp(color, vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+fn sample_bicubic_mip(src: vec2<f32>, level: u32) -> vec4<f32> {
+    let scale = f32(1u << level);
+    let mip_pos = src / scale;
+    let base = vec2<i32>(floor(mip_pos));
+    let wx = catmull_rom_weights(fract(mip_pos.x));
+    let wy = catmull_rom_weights(fract(mip_pos.y));
+    var color = vec4<f32>(0.0);
+    for (var row = 0; row < 4; row += 1) {
+        var horizontal = vec4<f32>(0.0);
+        for (var column = 0; column < 4; column += 1) {
+            horizontal += load_source_pixel_mip(vec2<f32>(base + vec2<i32>(column - 1, row - 1)) * scale, level) * wx[column];
+        }
+        color += horizontal * wy[row];
+    }
+    return clamp(color, vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+fn sample_anisotropic(src: vec2<f32>, major: vec2<f32>, level: u32) -> vec4<f32> {
+    var color = vec4<f32>(0.0);
+    for (var tap = 0u; tap < anisotropy_level; tap += 1u) {
+        let offset = (f32(tap) + 0.5) / f32(anisotropy_level) - 0.5;
+        let position = src + major * offset;
+        if (reconstruction_mode == 2u) { color += sample_bicubic_mip(position, level); }
+        else if (reconstruction_mode == 1u) { color += sample_bilinear_mip(position, level); }
+        else { color += load_source_pixel_mip(position, level); }
+    }
+    return color / f32(anisotropy_level);
 }
 
 fn euclidean_modulo(a : f32, b : f32) -> f32 {
@@ -329,73 +458,49 @@ fn source_in_bounds(src_i: vec2<i32>) -> bool {
         src_i.y < i32(settings.source_height);
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let local_x = gid.x;
-    let local_y = gid.y;
+// Applies the configured hue rotation (in degrees) to an RGB color via an
+// RGB→HSV→RGB round trip. Factored out of `main()` so both the nearest-neighbor
+// and `anti_alias` (bilinear) sampling paths share the same hue-rotation code
+// instead of duplicating it.
+fn hash_recolor_cell(cell: vec2<i32>, seed: u32) -> u32 {
+    var h = u32(cell.x) * 0x8da6b343u ^ u32(cell.y) * 0xd8163841u ^ seed;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    return h ^ (h >> 16u);
+}
 
-    let out_dims = textureDimensions(output_tex);
-    if (local_x >= out_dims.x || local_y >= out_dims.y) {
-        return;
-    }
-
-    let x = settings.output_tile_origin_x + local_x;
-    let y = settings.output_tile_origin_y + local_y;
-
-    if (x >= settings.output_size_w || y >= settings.output_size_h) {
-        return;
-    }
-
-    let center_x = f32(settings.output_size_w) * 0.5 + f32(settings.offset_x);
-    let center_y = f32(settings.output_size_h) * 0.5 + f32(settings.offset_y);
-
-    let width_over_2 = f32(settings.output_size_w) * 0.5;
-
-    let dx = f32(x) - center_x;
-    let dy = f32(y) - center_y;
-
-    var mapped = vec2<f32>(dx, dy);
-
-    switch settings.kaleido_type {
-        case 0u: {
-            mapped = map_radial(dx, dy, settings.zoom, settings.slice_angle, settings.triangle_rotation_rad);
-        }
-        case 1u: {
-            mapped = map_square(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
-        }
-        case 2u: {
-            mapped = map_diamond(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
-        }
-        case 3u: {
-            mapped = map_hexagonal(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
-        }
-        case 4u: {
-            mapped = map_hexagonal_flat_top(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
-        }
-        default: {
-            mapped = vec2<f32>(dx, dy);
+fn voronoi_recolor_offset(position: vec2<f32>, offsets: array<f32, 8>) -> f32 {
+    let cell_size = clamp(settings.recolor_cell_size, 4.0, 512.0);
+    let grid = vec2<i32>(floor(position / cell_size));
+    var best_distance = 3.402823466e+38;
+    var best_hash = 0u;
+    for (var dy = -1; dy <= 1; dy += 1) {
+        for (var dx = -1; dx <= 1; dx += 1) {
+            let cell = grid + vec2<i32>(dx, dy);
+            let hx = hash_recolor_cell(cell, settings.recolor_seed_words.x);
+            let hy = hash_recolor_cell(cell, settings.recolor_seed_words.y);
+            let jitter = vec2<f32>(f32(hx), f32(hy)) / 4294967295.0;
+            let center = (vec2<f32>(cell) + vec2<f32>(0.15) + jitter * 0.7) * cell_size;
+            let delta = position - center;
+            let distance = dot(delta, delta);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_hash = hash_recolor_cell(cell, settings.recolor_seed_words.z);
+            }
         }
     }
+    return offsets[best_hash % 8u];
+}
 
-    let src_x = round(mapped.x);
-    let src_y = round(mapped.y);
-    let src_i = vec2<i32>(i32(src_x), i32(src_y));
+fn apply_hue_rotation(rgb: vec3<f32>, source_position: vec2<f32>) -> vec3<f32> {
+    var final_rgb = rgb;
 
-    if (!source_in_bounds(src_i)) {
-        textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
-        return;
-    }
-
-    let color = load_source_pixel(src_i);
-
-    // daydream
-    // rgb to hsv conversion for hue rotation
-    var final_rgb = color.rgb;
-
-    if (settings.hue_rotation % 360 != 0u) {
-        let r = color.r;
-        let g = color.g;
-        let b = color.b;
+    if (settings.hue_rotation % 360 != 0u || settings.recolor_enabled != 0u) {
+        let r = rgb.r;
+        let g = rgb.g;
+        let b = rgb.b;
 
         let c_max = max(r, max(g, b));
         let c_min = min(r, min(g, b));
@@ -419,7 +524,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let v = c_max;
 
-        h = euclidean_modulo(h + f32(settings.hue_rotation), 360.0);
+        var recolor_degrees = 0.0;
+        if (settings.recolor_enabled != 0u) {
+            let hue01 = euclidean_modulo(h, 360.0) / 360.0;
+            let offsets = array<f32, 8>(
+                settings.recolor_offsets_0.x, settings.recolor_offsets_0.y,
+                settings.recolor_offsets_0.z, settings.recolor_offsets_0.w,
+                settings.recolor_offsets_1.x, settings.recolor_offsets_1.y,
+                settings.recolor_offsets_1.z, settings.recolor_offsets_1.w,
+            );
+            let edge = min(settings.recolor_threshold + 0.08, 1.0);
+            var strength = smoothstep(settings.recolor_threshold, edge, s);
+            var offset = 0.0;
+            if (settings.recolor_mode == 1u) {
+                // Smaller bordered-cell mode: preserve dark outlines and use
+                // hue, saturation and value together to distinguish fills.
+                strength *= smoothstep(settings.recolor_threshold * 0.75, min(settings.recolor_threshold * 0.75 + 0.12, 1.0), v);
+                let hue_bin = u32(floor(hue01 * 8.0)) % 8u;
+                let sat_bin = u32(floor(clamp(s, 0.0, 0.999999) * 4.0));
+                let value_position = clamp(v, 0.0, 0.999999) * 4.0;
+                let value_bin = u32(floor(value_position));
+                let next_value = min(value_bin + 1u, 3u);
+                let a = (hue_bin + sat_bin * 5u + value_bin * 3u) % 8u;
+                let b = (hue_bin + sat_bin * 5u + next_value * 3u) % 8u;
+                let fraction = fract(value_position);
+                let blend = fraction * fraction * (3.0 - 2.0 * fraction);
+                offset = mix(offsets[a], offsets[b], blend);
+            } else if (settings.recolor_mode == 2u) {
+                offset = voronoi_recolor_offset(source_position, offsets);
+            } else {
+                let band_position = hue01 * 8.0;
+                let band = u32(floor(band_position)) % 8u;
+                let next_band = (band + 1u) % 8u;
+                let fraction = fract(band_position);
+                let blend = fraction * fraction * (3.0 - 2.0 * fraction);
+                offset = mix(offsets[band], offsets[next_band], blend);
+            }
+            recolor_degrees = offset * strength * 360.0;
+        }
+        h = euclidean_modulo(h + recolor_degrees + f32(settings.hue_rotation), 360.0);
         let h_sector = h / 60.0;
 
         let c = v * s;
@@ -458,6 +601,116 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         final_rgb = vec3<f32>(rp + m, gp + m, bp + m);
     }
+
+    return final_rgb;
+}
+
+fn map_output_coordinate(x: u32, y: u32) -> vec2<f32> {
+    let center_x = f32(settings.output_size_w) * 0.5 + f32(settings.offset_x);
+    let center_y = f32(settings.output_size_h) * 0.5 + f32(settings.offset_y);
+
+    let width_over_2 = f32(settings.output_size_w) * 0.5;
+
+    let dx = f32(x) - center_x;
+    var dy = f32(y) - center_y;
+
+    // `aspect_correct`: scale dy by the canvas's width/height ratio before the
+    // angle/radius is computed, mirroring the CPU backends' shared `inner_loop`
+    // (backends/mod.rs) so the two render paths look identical. Disabled by
+    // default, so output for existing presets is unchanged.
+    if (settings.aspect_correct != 0u) {
+        let aspect_ratio = f32(settings.output_size_w) / max(f32(settings.output_size_h), 1.0);
+        dy = dy * aspect_ratio;
+    }
+
+    var mapped = vec2<f32>(dx, dy);
+
+    switch settings.kaleido_type {
+        case 0u: {
+            mapped = map_radial(dx, dy, settings.zoom, settings.slice_angle, settings.triangle_rotation_rad);
+        }
+        case 1u: {
+            mapped = map_square(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
+        }
+        case 2u: {
+            mapped = map_diamond(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
+        }
+        case 3u: {
+            mapped = map_hexagonal(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
+        }
+        case 4u: {
+            mapped = map_hexagonal_flat_top(dx, dy, width_over_2, settings.slice_angle, settings.tile_count, settings.zoom, settings.triangle_rotation_rad, settings.triangle_center_x, settings.triangle_center_y);
+        }
+        default: {
+            mapped = vec2<f32>(dx, dy);
+        }
+    }
+    return mapped;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let local_x = gid.x;
+    let local_y = gid.y;
+    let out_dims = textureDimensions(output_tex);
+    if (local_x >= out_dims.x || local_y >= out_dims.y) { return; }
+    let x = settings.output_tile_origin_x + local_x;
+    let y = settings.output_tile_origin_y + local_y;
+    if (x >= settings.output_size_w || y >= settings.output_size_h) { return; }
+
+    let mapped = map_output_coordinate(x, y);
+    let mapped_dx = map_output_coordinate(min(x + 1u, settings.output_size_w - 1u), y) - mapped;
+    let mapped_dy = map_output_coordinate(x, min(y + 1u, settings.output_size_h - 1u)) - mapped;
+    let minor_footprint = max(min(length(mapped_dx), length(mapped_dy)), 1.0);
+    let mip_level = select(0u, u32(clamp(floor(log2(minor_footprint)), 0.0, f32(textureNumLevels(input_tex) - 1u))), derivative_mipmapping != 0u);
+    let major = select(mapped_dy, mapped_dx, dot(mapped_dx, mapped_dx) >= dot(mapped_dy, mapped_dy));
+
+    let src_x = round(mapped.x);
+    let src_y = round(mapped.y);
+    let src_i = vec2<i32>(i32(src_x), i32(src_y));
+
+    // `anti_alias`: bilinear-blend the four nearest texels instead of rounding
+    // to the nearest one. Uses a 1px-tolerant bounds check (mirroring the CPU
+    // backends' `bilinear_sample`) since the blend itself clamps to the image
+    // edge, so texels just outside the strict integer bounds are still valid.
+    if (reconstruction_mode == 2u) {
+        let in_bounds_bicubic = mapped.x >= -2.0 && mapped.x < f32(settings.source_width) + 2.0
+            && mapped.y >= -2.0 && mapped.y < f32(settings.source_height) + 2.0;
+        if (!in_bounds_bicubic) {
+            textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(0.0));
+            return;
+        }
+        let color = sample_anisotropic(mapped, major, mip_level);
+        textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(apply_hue_rotation(color.rgb, mapped), color.a));
+        return;
+    }
+
+    if (reconstruction_mode == 1u) {
+        let in_bounds_bilinear = mapped.x >= -1.0 && mapped.x < f32(settings.source_width) + 1.0
+            && mapped.y >= -1.0 && mapped.y < f32(settings.source_height) + 1.0;
+        if (!in_bounds_bilinear) {
+            textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+            return;
+        }
+
+        let clamped_position = clamp(mapped, vec2<f32>(0.0), vec2<f32>(f32(settings.source_width) - 1.0, f32(settings.source_height) - 1.0));
+        let color = sample_anisotropic(clamped_position, major, mip_level);
+        let final_rgb = apply_hue_rotation(color.rgb, clamped_position);
+        textureStore(
+            output_tex,
+            vec2<i32>(i32(local_x), i32(local_y)),
+            vec4<f32>(final_rgb, color.a),
+        );
+        return;
+    }
+
+    if (!source_in_bounds(src_i)) {
+        textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    let color = sample_anisotropic(mapped, major, mip_level);
+    let final_rgb = apply_hue_rotation(color.rgb, mapped);
 
     textureStore(
         output_tex,

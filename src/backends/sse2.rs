@@ -1,3 +1,4 @@
+// kaleidomo-core/src/backends/sse2.rs
 #[cfg(target_arch = "x86")]
 pub use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
@@ -6,6 +7,7 @@ pub use core::arch::x86_64::*;
 use image::GenericImageView;
 
 use crate::{DaydreamBackend, image::DynamicImage, KaleidoBackend};
+use crate::backends::{reconstruction_sample, reconstruction_sample_hue_shift};
 #[target_feature(enable = "sse2")]
 #[inline]
 unsafe fn atan(x: __m128) -> __m128 {
@@ -153,9 +155,16 @@ impl KaleidoBackend for __m128 {
         )
     }
     #[target_feature(enable = "sse2")]
+    #[inline] unsafe fn write_lanes(self, output: &mut [f32]) { unsafe { _mm_storeu_ps(output.as_mut_ptr(), self); } }
+    #[target_feature(enable = "sse2")]
     #[inline]
     unsafe fn normalize_coords(&mut self, center: Self) {
         *self = _mm_sub_ps(*self, center);
+    }
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    unsafe fn scale(self, factor: Self) -> Self {
+        unsafe { _mm_mul_ps(self, factor) }
     }
     #[target_feature(enable = "sse2")]
     #[inline]
@@ -261,7 +270,7 @@ impl KaleidoBackend for __m128 {
     }
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn store_pixel(
+    unsafe fn store_pixel<const SAMPLING_MODE: u8>(
         output: &mut [u8],
         _x: u32,
         sx: Self,
@@ -287,6 +296,29 @@ impl KaleidoBackend for __m128 {
             );
 
             let lane_mask = _mm_movemask_ps(v_mask) as u32;
+
+            if SAMPLING_MODE != 0 {
+                // anti_alias path: bilinear filtering isn't vectorizable across lanes
+                // (each lane gathers from a different, data-dependent texel), so we
+                // extract the raw (unrounded) per-lane floats and blend each pixel
+                // via the shared scalar `bilinear_sample` helper.
+                let mut raw_x = [0.0f32; Self::NUM_FLOATS];
+                let mut raw_y = [0.0f32; Self::NUM_FLOATS];
+                _mm_storeu_ps(raw_x.as_mut_ptr(), sx);
+                _mm_storeu_ps(raw_y.as_mut_ptr(), sy);
+
+                for i in 0..Self::NUM_FLOATS {
+                    if ((lane_mask >> i) & 1) != 0
+                        || (raw_x[i] >= -1.0 && raw_x[i] < sw as f32 + 1.0
+                            && raw_y[i] >= -1.0 && raw_y[i] < sh as f32 + 1.0)
+                    {
+                        let offset = i * 4;
+                        let pixel = reconstruction_sample::<SAMPLING_MODE>(source, raw_x[i], raw_y[i], sw, sh);
+                        output[offset..offset + 4].copy_from_slice(&pixel);
+                    }
+                }
+                return;
+            }
 
             let max_x = _mm_set1_ps(sw.saturating_sub(1) as f32);
             let max_y = _mm_set1_ps(sh.saturating_sub(1) as f32);
@@ -886,7 +918,7 @@ impl DaydreamBackend for __m128 {
 
     #[target_feature(enable = "sse,sse2")]
     #[inline]
-    unsafe fn store_pixel_hue_shift(
+    unsafe fn store_pixel_hue_shift<const SAMPLING_MODE: u8>(
         buff: &mut [u8],
         _x: u32,
         sx: Self,
@@ -910,6 +942,30 @@ impl DaydreamBackend for __m128 {
         use std::arch::x86_64::*;
 
         unsafe {
+            if SAMPLING_MODE != 0 {
+                // anti_alias path: same rationale as `store_pixel` — gather + blend
+                // per lane via the shared scalar helper instead of the fast SIMD
+                // nearest + integer-hue-rotation path below.
+                let mut raw_x = [0.0f32; Self::NUM_FLOATS];
+                let mut raw_y = [0.0f32; Self::NUM_FLOATS];
+                _mm_storeu_ps(raw_x.as_mut_ptr(), sx);
+                _mm_storeu_ps(raw_y.as_mut_ptr(), sy);
+                let hue_shift_degrees = _mm_cvtss_f32(hue_shift_vec);
+
+                for i in 0..Self::NUM_FLOATS {
+                    if raw_x[i] >= -1.0 && raw_x[i] < source_width as f32 + 1.0
+                        && raw_y[i] >= -1.0 && raw_y[i] < source_height as f32 + 1.0
+                    {
+                        let offset = i * 4;
+                        let pixel = reconstruction_sample_hue_shift::<SAMPLING_MODE>(
+                            source, raw_x[i], raw_y[i], source_width, source_height, hue_shift_degrees,
+                        );
+                        buff[offset..offset + 4].copy_from_slice(&pixel);
+                    }
+                }
+                return;
+            }
+
             let zero_f = _mm_set1_ps(0.0);
             let sw_v = _mm_set1_ps(source_width as f32);
             let sh_v = _mm_set1_ps(source_height as f32);

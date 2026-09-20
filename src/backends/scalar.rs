@@ -1,6 +1,8 @@
+// kaleidomo-core/src/backends/scalar.rs
 use image::{DynamicImage, GenericImageView};
 
 use crate::backends::DaydreamBackend;
+use crate::backends::{reconstruction_sample, reconstruction_sample_hue_shift};
 
 use super::KaleidoBackend;
 
@@ -28,10 +30,16 @@ impl KaleidoBackend for f32 {
     unsafe fn load_coords(x: u32, y: u32) -> (Self, Self) {
         (x as f32, y as f32)
     }
+    #[inline] unsafe fn write_lanes(self, output: &mut [f32]) { output[0] = self; }
 
     #[inline]
     unsafe fn normalize_coords(&mut self, center: Self) {
         *self -= center;
+    }
+
+    #[inline]
+    unsafe fn scale(self, factor: Self) -> Self {
+        self * factor
     }
 
     #[inline]
@@ -74,7 +82,7 @@ impl KaleidoBackend for f32 {
     }
 
     #[inline]
-    unsafe fn store_pixel(
+    unsafe fn store_pixel<const SAMPLING_MODE: u8>(
         output: &mut [u8],
         _x: u32,
         sx: Self,
@@ -83,6 +91,14 @@ impl KaleidoBackend for f32 {
         sw: u32,
         sh: u32,
     ) {
+        if SAMPLING_MODE != 0 {
+            // anti_alias path: blend the four nearest texels instead of rounding.
+            if sx >= -1.0 && sx < sw as f32 + 1.0 && sy >= -1.0 && sy < sh as f32 + 1.0 {
+                let pixel = reconstruction_sample::<SAMPLING_MODE>(source, sx, sy, sw, sh);
+                output[0..4].copy_from_slice(&pixel);
+            }
+            return;
+        }
         let sx_i = sx.round() as u32;
         let sy_i = sy.round() as u32;
         if sx_i < sw && sy_i < sh {
@@ -462,7 +478,7 @@ impl DaydreamBackend for f32 {
     }
 
     #[inline]
-    unsafe fn store_pixel_hue_shift(
+    unsafe fn store_pixel_hue_shift<const SAMPLING_MODE: u8>(
         output: &mut [u8],
         _x: u32,
         sx: Self,
@@ -484,6 +500,13 @@ impl DaydreamBackend for f32 {
         _three: Self,
     ) {
         unsafe {
+            if SAMPLING_MODE != 0 {
+                if sx >= -1.0 && sx < sw as f32 + 1.0 && sy >= -1.0 && sy < sh as f32 + 1.0 {
+                    let pixel = reconstruction_sample_hue_shift::<SAMPLING_MODE>(source, sx, sy, sw, sh, hue_shift_vec);
+                    output[0..4].copy_from_slice(&pixel);
+                }
+                return;
+            }
             let sx_i = sx.round() as u32;
             let sy_i = sy.round() as u32;
             if sx_i < sw && sy_i < sh {

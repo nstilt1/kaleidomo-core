@@ -549,6 +549,18 @@ impl LiveKaleidoscopeEngine {
             triangle_rotation_rad: 0.0,
             kaleido_type: KaleidoType::Radial,
             hue_rotation: 0,
+            recolor_enabled: false,
+            recolor_seed: String::new(),
+            recolor_mode: 0,
+            recolor_threshold: 0.08,
+            recolor_cell_size: 64.0,
+            // Enhancements default disabled until `start_animation()`/`update_animation_settings()`
+            // supply real values from the JS side.
+            anti_alias: 0,
+            derivative_mipmapping: true,
+            anisotropy_level: 1,
+            super_sample: 1,
+            aspect_correct: false,
         };
 
         let state = EngineState {
@@ -640,6 +652,12 @@ impl LiveKaleidoscopeEngine {
     /// * `base_settings_js` — a JS object matching `KaleidoSettings` (count, offset_x/y, zoom,
     ///   tile_count, triangle_center_x/y, triangle_rotation_rad, kaleido_type_idx, hue_rotation)
     /// * `video_settings` — a `WasmVideoSettings` instance
+    /// * `anti_alias` — enables bilinear texture filtering when sampling the source image
+    ///   instead of nearest-neighbor. Default/disabled value: `false`.
+    /// * `super_sample` — internal supersampling factor (`1` = disabled/native resolution,
+    ///   `2`-`4` render larger internally and box-downsample). Default/disabled value: `1`.
+    /// * `aspect_correct` — corrects the kaleidoscope pattern so it isn't visually stretched
+    ///   into an ellipse when the canvas is non-square. Default/disabled value: `false`.
     pub fn start_animation(
         &mut self,
         count: u32,
@@ -652,7 +670,15 @@ impl LiveKaleidoscopeEngine {
         triangle_rotation_rad: f32,
         kaleido_type_idx: u32,
         hue_rotation: u32,
+        recolor_enabled: bool,
+        recolor_seed: String,
+        recolor_mode: u8,
+        recolor_threshold: f32,
+        recolor_cell_size: f32,
         video_settings: &WasmVideoSettings,
+        anti_alias: u8,
+        super_sample: u8,
+        aspect_correct: bool,
     ) -> Result<(), JsValue> {
         // Stop any previous loop
         self.stop_animation();
@@ -676,6 +702,17 @@ impl LiveKaleidoscopeEngine {
                 triangle_rotation_rad,
                 kaleido_type: kaleido_type_from_idx(kaleido_type_idx),
                 hue_rotation,
+                recolor_enabled,
+                recolor_seed,
+                recolor_mode,
+                recolor_threshold,
+                recolor_cell_size,
+                // Enhancements — see param docs above; disabled unless explicitly requested.
+                anti_alias,
+                derivative_mipmapping: true,
+                anisotropy_level: 1,
+                super_sample: crate::safe_super_sample(super_sample, state.canvas_width, state.canvas_height),
+                aspect_correct,
             };
             state.video_settings = video_settings.clone();
             state.frame_index = 0;
@@ -754,6 +791,9 @@ impl LiveKaleidoscopeEngine {
         Ok(())
     }
 
+    /// * `anti_alias` — bilinear texture filtering instead of nearest-neighbor. Default: `false`.
+    /// * `super_sample` — internal supersampling factor, `1`-`4` (`1` disables it). Default: `1`.
+    /// * `aspect_correct` — corrects stretching on non-square canvases. Default: `false`.
     #[cfg(feature = "dev")]
     pub fn render_frame(
         &mut self,
@@ -767,8 +807,16 @@ impl LiveKaleidoscopeEngine {
         triangle_rotation_rad: f32,
         kaleido_type_idx: u32,
         hue_rotation: u32,
+        recolor_enabled: bool,
+        recolor_seed: String,
+        recolor_mode: u8,
+        recolor_threshold: f32,
+        recolor_cell_size: f32,
         video_settings: &WasmVideoSettings,
         frame: u32,
+        anti_alias: u8,
+        super_sample: u8,
+        aspect_correct: bool,
     ) -> Result<(), JsValue> {
         {
             let mut guard = self.state.borrow_mut();
@@ -789,6 +837,14 @@ impl LiveKaleidoscopeEngine {
                 triangle_rotation_rad,
                 kaleido_type: kaleido_type_from_idx(kaleido_type_idx),
                 hue_rotation,
+                recolor_enabled,
+                recolor_seed,
+                recolor_mode,
+                recolor_threshold,
+                recolor_cell_size,
+                anti_alias,
+                super_sample: crate::safe_super_sample(super_sample, state.canvas_width, state.canvas_height),
+                aspect_correct,
             };
 
             state.video_settings = video_settings.clone();
@@ -798,6 +854,9 @@ impl LiveKaleidoscopeEngine {
         render_one_frame(&self.state, 0.0)
     }
 
+    /// * `anti_alias` — bilinear texture filtering instead of nearest-neighbor. Default: `false`.
+    /// * `super_sample` — internal supersampling factor, `1`-`4` (`1` disables it). Default: `1`.
+    /// * `aspect_correct` — corrects stretching on non-square canvases. Default: `false`.
     pub fn update_animation_settings(
         &mut self,
         count: u32,
@@ -810,7 +869,15 @@ impl LiveKaleidoscopeEngine {
         triangle_rotation_rad: f32,
         kaleido_type_idx: u32,
         hue_rotation: u32,
+        recolor_enabled: bool,
+        recolor_seed: String,
+        recolor_mode: u8,
+        recolor_threshold: f32,
+        recolor_cell_size: f32,
         video_settings: &WasmVideoSettings,
+        anti_alias: u8,
+        super_sample: u8,
+        aspect_correct: bool,
     ) -> Result<(), JsValue> {
         let mut guard = self.state.borrow_mut();
         let state = guard
@@ -830,6 +897,16 @@ impl LiveKaleidoscopeEngine {
             triangle_rotation_rad,
             kaleido_type: kaleido_type_from_idx(kaleido_type_idx),
             hue_rotation,
+            recolor_enabled,
+            recolor_seed,
+            recolor_mode,
+            recolor_threshold,
+            recolor_cell_size,
+            anti_alias,
+            derivative_mipmapping: true,
+            anisotropy_level: 1,
+            super_sample: crate::safe_super_sample(super_sample, state.canvas_width, state.canvas_height),
+            aspect_correct,
         };
 
         state.video_settings = video_settings.clone();

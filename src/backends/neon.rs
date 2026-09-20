@@ -1,8 +1,10 @@
+// kaleidomo-core/src/backends/neon.rs
 use core::arch::aarch64::*;
 
 use image::GenericImageView;
 
 use crate::backends::DaydreamBackend;
+use crate::backends::{reconstruction_sample, reconstruction_sample_hue_shift};
 
 use super::KaleidoBackend;
 
@@ -138,11 +140,18 @@ impl KaleidoBackend for float32x4_t {
             (x_vec, y_vec)
         }
     }
+    #[inline] unsafe fn write_lanes(self, output: &mut [f32]) { unsafe { vst1q_f32(output.as_mut_ptr(), self); } }
 
     #[target_feature(enable = "neon")]
     #[inline]
     unsafe fn normalize_coords(&mut self, center: Self) {
         *self = vsubq_f32(*self, center);
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    unsafe fn scale(self, factor: Self) -> Self {
+        unsafe { vmulq_f32(self, factor) }
     }
 
     #[target_feature(enable = "neon")]
@@ -243,7 +252,7 @@ impl KaleidoBackend for float32x4_t {
 
     #[target_feature(enable = "neon")]
     #[inline]
-    unsafe fn store_pixel(
+    unsafe fn store_pixel<const SAMPLING_MODE: u8>(
         output: &mut [u8],
         _x: u32,
         sx: Self,
@@ -262,6 +271,27 @@ impl KaleidoBackend for float32x4_t {
                 vandq_u32(vcgeq_f32(sx, zero), vcltq_f32(sx, sw_v)),
                 vandq_u32(vcgeq_f32(sy, zero), vcltq_f32(sy, sh_v)),
             );
+
+            if SAMPLING_MODE != 0 {
+                // anti_alias path: extract raw per-lane floats and blend each pixel
+                // via the shared scalar `bilinear_sample` helper (see the SSE2
+                // backend's `store_pixel` for the full rationale).
+                let mut raw_x = [0.0f32; 4];
+                let mut raw_y = [0.0f32; 4];
+                vst1q_f32(raw_x.as_mut_ptr(), sx);
+                vst1q_f32(raw_y.as_mut_ptr(), sy);
+
+                for i in 0..4 {
+                    if raw_x[i] >= -1.0 && raw_x[i] < sw as f32 + 1.0
+                        && raw_y[i] >= -1.0 && raw_y[i] < sh as f32 + 1.0
+                    {
+                        let base_idx = i * 4;
+                        let pixel = reconstruction_sample::<SAMPLING_MODE>(source, raw_x[i], raw_y[i], sw, sh);
+                        output[base_idx..base_idx + 4].copy_from_slice(&pixel);
+                    }
+                }
+                return;
+            }
 
             if vmaxvq_u32(v_mask) == 0 {
                 return;
@@ -800,7 +830,7 @@ impl DaydreamBackend for float32x4_t {
     }
     #[target_feature(enable = "neon")]
     #[inline]
-    unsafe fn store_pixel_hue_shift(
+    unsafe fn store_pixel_hue_shift<const SAMPLING_MODE: u8>(
         buff: &mut [u8],
         _x: u32,
         sx: Self,
@@ -822,6 +852,30 @@ impl DaydreamBackend for float32x4_t {
         three: Self,
     ) {
         unsafe {
+            if SAMPLING_MODE != 0 {
+                // anti_alias path — see the SSE2 backend's `store_pixel` for the rationale.
+                let mut raw_x = [0.0f32; 4];
+                let mut raw_y = [0.0f32; 4];
+                vst1q_f32(raw_x.as_mut_ptr(), sx);
+                vst1q_f32(raw_y.as_mut_ptr(), sy);
+                let mut hue_arr = [0.0f32; 4];
+                vst1q_f32(hue_arr.as_mut_ptr(), hue_shift_vec);
+                let hue_shift_degrees = hue_arr[0];
+
+                for i in 0..4 {
+                    if raw_x[i] >= -1.0 && raw_x[i] < source_width as f32 + 1.0
+                        && raw_y[i] >= -1.0 && raw_y[i] < source_height as f32 + 1.0
+                    {
+                        let base_idx = i * 4;
+                        let pixel = reconstruction_sample_hue_shift::<SAMPLING_MODE>(
+                            source, raw_x[i], raw_y[i], source_width, source_height, hue_shift_degrees,
+                        );
+                        buff[base_idx..base_idx + 4].copy_from_slice(&pixel);
+                    }
+                }
+                return;
+            }
+
             let zero_f = vdupq_n_f32(0.0);
             let sw_v = vdupq_n_f32(source_width as f32);
             let sh_v = vdupq_n_f32(source_height as f32);

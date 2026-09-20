@@ -1,12 +1,19 @@
+// kaleidomo-core/src/lib.rs
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 
 pub mod backends;
+pub mod enhancement;
+pub mod preprocess;
 #[cfg(not(target_arch = "wasm32"))]
 mod rlib;
+#[cfg(not(target_arch = "wasm32"))]
+mod video_sink;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use rlib::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use video_sink::{VideoFrameSink, VideoSinkError};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
@@ -44,7 +51,63 @@ pub struct KaleidoSettings {
     pub triangle_rotation_rad: f32, // Rotation of the triangle in radians
     pub kaleido_type: KaleidoType,  // Type of kaleidoscope (radial, square, etc.)
     pub hue_rotation: u32, // Hue rotation in degrees (0-360)
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    pub recolor_enabled: bool,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    pub recolor_seed: String,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    pub recolor_mode: u8,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_recolor_threshold"))]
+    pub recolor_threshold: f32,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_recolor_cell_size"))]
+    pub recolor_cell_size: f32,
+
+    // ── Enhancements (all default-disabled to preserve existing look/output) ──
+    /// Enables bilinear texture filtering when sampling the source image,
+    /// softening hard pixel edges and mirrored wedge seams. When `false`
+    /// (the default), sampling is nearest-neighbor, matching all prior
+    /// rendered output and existing `.kmo.json` presets that predate this field.
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    /// Source reconstruction mode: 0 = nearest, 1 = bilinear, 2 = Catmull-Rom bicubic.
+    pub anti_alias: u8,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_true"))]
+    pub derivative_mipmapping: bool,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_anisotropy"))]
+    pub anisotropy_level: u8,
+    /// Internal supersampling factor. `1` (the default) disables supersampling
+    /// and renders at native `output_size_w`/`output_size_h`. Values `2`-`4`
+    /// render the frame at `output_size * super_sample` internally and then
+    /// box-downsample back down to the requested output size, reducing
+    /// aliasing across the whole image (not just at texture edges). Values
+    /// are clamped to `1..=4` by callers to bound the extra render cost.
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_super_sample"))]
+    pub super_sample: u8,
+    /// Corrects the kaleidoscope pattern for non-square output canvases. When
+    /// `false` (the default, matching all existing presets), the pattern is
+    /// mapped 1:1 to pixel coordinates, which visually stretches the mirrored
+    /// wedges into an ellipse whenever `output_size_w != output_size_h`. When
+    /// `true`, the vertical axis is scaled by the canvas aspect ratio before
+    /// the angle/radius is computed, so wedges stay proportional instead of
+    /// looking stretched.
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default))]
+    pub aspect_correct: bool,
 }
+
+/// Default value for `KaleidoSettings::super_sample` used by `serde(default = ...)`
+/// so that presets/JSON saved before this field existed deserialize with
+/// supersampling disabled (`1`) rather than `0`.
+#[cfg(not(target_arch = "wasm32"))]
+fn default_super_sample() -> u8 {
+    1
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn default_true() -> bool { true }
+#[cfg(not(target_arch = "wasm32"))]
+fn default_anisotropy() -> u8 { 1 }
+#[cfg(not(target_arch = "wasm32"))]
+fn default_recolor_threshold() -> f32 { 0.08 }
+#[cfg(not(target_arch = "wasm32"))]
+fn default_recolor_cell_size() -> f32 { 64.0 }
 
 pub struct VideoSettings {
     /// The duration of the animation
@@ -189,5 +252,25 @@ fn modulate(
         },
 
         _ => range_min
+    }
+}
+
+/// Disable supersampling when either internal dimension would exceed 8192.
+pub fn safe_super_sample(factor: u8, width: u32, height: u32) -> u8 {
+    let factor = factor.clamp(1, 4);
+    if width > 8192 / factor as u32 || height > 8192 / factor as u32 { 1 } else { factor }
+}
+
+#[cfg(test)]
+mod supersampling_limit_tests {
+    use super::safe_super_sample;
+    #[test]
+    fn limits_both_dimensions_without_overflow() {
+        assert_eq!(safe_super_sample(4, 2048, 2048), 4);
+        assert_eq!(safe_super_sample(4, 2049, 2048), 1);
+        assert_eq!(safe_super_sample(2, 2000, 4097), 1);
+        assert_eq!(safe_super_sample(2, 4096, 4096), 2);
+        assert_eq!(safe_super_sample(4, u32::MAX, 1), 1);
+        assert_eq!(safe_super_sample(1, 9000, 1), 1);
     }
 }
