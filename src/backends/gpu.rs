@@ -165,6 +165,7 @@ impl GpuBackend {
         info!("GpuBackend initialized successfully");
 
         Ok(Self {
+            #[cfg(not(target_arch = "wasm32"))]
             instance: Some(instance),
             device,
             queue,
