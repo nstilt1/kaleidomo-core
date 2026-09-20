@@ -128,15 +128,18 @@ pub fn render_kaleidoscope_with_backend<B: KaleidoBackend + DaydreamBackend>(
         let mut rgba = source.to_rgba8();
         // A finite threshold is guaranteed by the UI/wire validation. If a
         // third-party caller supplies NaN, preserve the source rather than panic.
-        if crate::preprocess::preprocess_source_frame_with_mode(
+        if crate::preprocess::preprocess_source_frame_with_mode_and_cell_size(
             &mut rgba,
             settings.recolor_seed.as_bytes(),
             settings.recolor_threshold,
-            if settings.recolor_mode == 1 {
-                crate::preprocess::RecolorMode::BorderedCells
-            } else {
-                crate::preprocess::RecolorMode::ColorBands
+            match settings.recolor_mode {
+                1 => crate::preprocess::RecolorMode::BorderedCells,
+                2 => crate::preprocess::RecolorMode::SeededVoronoi,
+                3 => crate::preprocess::RecolorMode::ConnectedComponents,
+                4 => crate::preprocess::RecolorMode::SlicSuperpixels,
+                _ => crate::preprocess::RecolorMode::ColorBands,
             },
+            settings.recolor_cell_size,
         ).is_ok() {
             processed_source = DynamicImage::ImageRgba8(rgba);
             &processed_source
@@ -803,6 +806,7 @@ pub fn render_video_gpu(
     let render_offset_x = settings.offset_x * factor as i32;
     let render_offset_y = settings.offset_y * factor as i32;
 
+    gpu.prepare_source_for_settings(&settings).map_err(|e| e.to_string())?;
     let mut renderer = GpuVideoRenderer::new(
         gpu,
         render_w,
@@ -1016,6 +1020,7 @@ mod tests {
             recolor_seed: String::new(),
             recolor_mode: 0,
             recolor_threshold: 0.08,
+            recolor_cell_size: 64.0,
             anti_alias: reconstruction,
             derivative_mipmapping: derivatives,
             anisotropy_level: anisotropy,
@@ -1135,6 +1140,7 @@ mod tests {
             recolor_seed: String::new(),
             recolor_mode: 0,
             recolor_threshold: 0.08,
+            recolor_cell_size: 64.0,
             anti_alias: 1,
             derivative_mipmapping: true,
             anisotropy_level: 4,

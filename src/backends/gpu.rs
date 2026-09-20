@@ -18,6 +18,8 @@ pub struct GpuBackend {
     settings_buffer: wgpu::Buffer,
 
     source: Option<SourceImageGpu>,
+    original_source: Option<DynamicImage>,
+    prepared_recolor_key: Option<(u8, String, u32, u32)>,
     output: Option<OutputResources>,
     last_settings: Option<GpuKaleidoSettings>,
 
@@ -167,6 +169,8 @@ impl GpuBackend {
             pipelines,
             settings_buffer,
             source: None,
+            original_source: None,
+            prepared_recolor_key: None,
             output: None,
             last_settings: None,
             blit_bind_group_layout: None,
@@ -177,6 +181,12 @@ impl GpuBackend {
     }
 
     pub fn set_source_image(&mut self, source: &DynamicImage) -> Result<()> {
+        self.original_source = Some(source.clone());
+        self.prepared_recolor_key = None;
+        self.upload_source_image(source)
+    }
+
+    fn upload_source_image(&mut self, source: &DynamicImage) -> Result<()> {
         let rgba = source.to_rgba8();
         let (width, height) = rgba.dimensions();
 
@@ -329,6 +339,8 @@ impl GpuBackend {
     pub fn clear_source_image(&mut self) {
         warn!("Clearing current source image from GPU state");
         self.source = None;
+        self.original_source = None;
+        self.prepared_recolor_key = None;
         self.last_settings = None;
     }
 
@@ -357,6 +369,7 @@ impl GpuBackend {
     }
 
     pub fn render_into_buffer(&mut self, settings: &KaleidoSettings, output: &mut [u8]) -> Result<()> {
+        self.prepare_source_for_settings(settings)?;
         let expected_len = expected_rgba_len(settings.output_size_w, settings.output_size_h)?;
         if output.len() != expected_len {
             error!(
@@ -512,6 +525,38 @@ impl GpuBackend {
         Ok(())
     }
 
+    pub fn prepare_source_for_settings(&mut self, settings: &KaleidoSettings) -> Result<()> {
+        let global_mode = matches!(settings.recolor_mode, 3 | 4) && settings.recolor_enabled;
+        let desired_key = global_mode.then(|| (
+            settings.recolor_mode,
+            settings.recolor_seed.clone(),
+            settings.recolor_threshold.to_bits(),
+            settings.recolor_cell_size.to_bits(),
+        ));
+        if self.prepared_recolor_key == desired_key { return Ok(()); }
+        let original = self.original_source.clone().context("original source image is unavailable")?;
+        if let Some(key) = desired_key.as_ref() {
+            let mut rgba = original.to_rgba8();
+            let mode = if key.0 == 3 {
+                crate::preprocess::RecolorMode::ConnectedComponents
+            } else {
+                crate::preprocess::RecolorMode::SlicSuperpixels
+            };
+            crate::preprocess::preprocess_source_frame_with_mode_and_cell_size(
+                &mut rgba,
+                settings.recolor_seed.as_bytes(),
+                settings.recolor_threshold,
+                mode,
+                settings.recolor_cell_size,
+            ).map_err(|error| anyhow!(error.to_string()))?;
+            self.upload_source_image(&DynamicImage::ImageRgba8(rgba))?;
+        } else {
+            self.upload_source_image(&original)?;
+        }
+        self.prepared_recolor_key = desired_key;
+        Ok(())
+    }
+
     pub fn render_into_internal_buffer(&mut self, settings: &KaleidoSettings) -> Result<&[u8]> {
         let expected_len = expected_rgba_len(settings.output_size_w, settings.output_size_h)?;
         self.ensure_output_resources(settings.output_size_w, settings.output_size_h)?;
@@ -661,6 +706,8 @@ fn non_zero_u64(value: u64) -> Result<NonZeroU64> {
 
 #[cfg(test)]
 mod shader_tests {
+    use super::GpuKaleidoSettings;
+
     #[test]
     fn enhancement_shader_parses_and_validates() {
         let module = wgpu::naga::front::wgsl::parse_str(include_str!("kaleidomo.wgsl"))
@@ -669,6 +716,13 @@ mod shader_tests {
             wgpu::naga::valid::ValidationFlags::all(),
             wgpu::naga::valid::Capabilities::all(),
         ).validate(&module).expect("WGSL must validate");
+    }
+
+    #[test]
+    fn recolor_uniform_tail_matches_wgsl_scalar_layout() {
+        assert_eq!(std::mem::offset_of!(GpuKaleidoSettings, recolor_seed_words), 160);
+        assert_eq!(std::mem::offset_of!(GpuKaleidoSettings, recolor_cell_size), 176);
+        assert_eq!(std::mem::size_of::<GpuKaleidoSettings>(), 192);
     }
 }
 
@@ -732,6 +786,9 @@ pub struct GpuKaleidoSettings {
     pub recolor_enabled: u32,
     pub recolor_mode: u32,
     pub _pad4: u32,
+    pub recolor_seed_words: [u32; 4],
+    pub recolor_cell_size: f32,
+    pub _pad5: [u32; 3],
 }
 
 impl GpuKaleidoSettings {
@@ -752,6 +809,7 @@ impl GpuKaleidoSettings {
             settings.recolor_threshold,
         ).unwrap_or(crate::preprocess::PreprocessParams {
             hue_offsets: [0.0; crate::preprocess::HUE_BAND_COUNT],
+            seed_words: [0; 4],
             threshold: 1.0,
         });
 
@@ -793,9 +851,12 @@ impl GpuKaleidoSettings {
             recolor_offsets_0: recolor.hue_offsets[0..4].try_into().unwrap(),
             recolor_offsets_1: recolor.hue_offsets[4..8].try_into().unwrap(),
             recolor_threshold: recolor.threshold,
-            recolor_enabled: settings.recolor_enabled as u32,
+            recolor_enabled: (settings.recolor_enabled && settings.recolor_mode < 3) as u32,
             recolor_mode: settings.recolor_mode as u32,
             _pad4: 0,
+            recolor_seed_words: recolor.seed_words,
+            recolor_cell_size: settings.recolor_cell_size.clamp(4.0, 512.0),
+            _pad5: [0; 3],
         }
     }
 }
@@ -978,6 +1039,7 @@ impl<'a> GpuVideoRenderer<'a> {
                 recolor_seed: String::new(),
                 recolor_mode: 0,
                 recolor_threshold: 0.08,
+                recolor_cell_size: 64.0,
                 anti_alias: 0,
                 derivative_mipmapping: true,
                 anisotropy_level: 1,
@@ -1486,6 +1548,8 @@ impl GpuBackend {
             pipelines,
             settings_buffer,
             source:               None,
+            original_source:      None,
+            prepared_recolor_key: None,
             output:               None,
             last_settings:        None,
             blit_pipeline:        Some(blit_pipeline),
@@ -1519,6 +1583,7 @@ impl GpuBackend {
         external_settings_buffer: &wgpu::Buffer,
         swapchain_format:         wgpu::TextureFormat,
     ) -> Result<()> {
+        self.prepare_source_for_settings(settings)?;
         let width  = settings.output_size_w;
         let height = settings.output_size_h;
  

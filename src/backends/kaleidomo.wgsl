@@ -50,6 +50,11 @@ struct KaleidoSettings {
     recolor_enabled: u32,
     recolor_mode: u32,
     _pad4: u32,
+    recolor_seed_words: vec4<u32>,
+    recolor_cell_size: f32,
+    _pad5_0: u32,
+    _pad5_1: u32,
+    _pad5_2: u32,
 };
 
 @group(0) @binding(0)
@@ -457,7 +462,39 @@ fn source_in_bounds(src_i: vec2<i32>) -> bool {
 // RGB→HSV→RGB round trip. Factored out of `main()` so both the nearest-neighbor
 // and `anti_alias` (bilinear) sampling paths share the same hue-rotation code
 // instead of duplicating it.
-fn apply_hue_rotation(rgb: vec3<f32>) -> vec3<f32> {
+fn hash_recolor_cell(cell: vec2<i32>, seed: u32) -> u32 {
+    var h = u32(cell.x) * 0x8da6b343u ^ u32(cell.y) * 0xd8163841u ^ seed;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    return h ^ (h >> 16u);
+}
+
+fn voronoi_recolor_offset(position: vec2<f32>, offsets: array<f32, 8>) -> f32 {
+    let cell_size = clamp(settings.recolor_cell_size, 4.0, 512.0);
+    let grid = vec2<i32>(floor(position / cell_size));
+    var best_distance = 3.402823466e+38;
+    var best_hash = 0u;
+    for (var dy = -1; dy <= 1; dy += 1) {
+        for (var dx = -1; dx <= 1; dx += 1) {
+            let cell = grid + vec2<i32>(dx, dy);
+            let hx = hash_recolor_cell(cell, settings.recolor_seed_words.x);
+            let hy = hash_recolor_cell(cell, settings.recolor_seed_words.y);
+            let jitter = vec2<f32>(f32(hx), f32(hy)) / 4294967295.0;
+            let center = (vec2<f32>(cell) + vec2<f32>(0.15) + jitter * 0.7) * cell_size;
+            let delta = position - center;
+            let distance = dot(delta, delta);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_hash = hash_recolor_cell(cell, settings.recolor_seed_words.z);
+            }
+        }
+    }
+    return offsets[best_hash % 8u];
+}
+
+fn apply_hue_rotation(rgb: vec3<f32>, source_position: vec2<f32>) -> vec3<f32> {
     var final_rgb = rgb;
 
     if (settings.hue_rotation % 360 != 0u || settings.recolor_enabled != 0u) {
@@ -513,6 +550,8 @@ fn apply_hue_rotation(rgb: vec3<f32>) -> vec3<f32> {
                 let fraction = fract(value_position);
                 let blend = fraction * fraction * (3.0 - 2.0 * fraction);
                 offset = mix(offsets[a], offsets[b], blend);
+            } else if (settings.recolor_mode == 2u) {
+                offset = voronoi_recolor_offset(source_position, offsets);
             } else {
                 let band_position = hue01 * 8.0;
                 let band = u32(floor(band_position)) % 8u;
@@ -642,7 +681,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             return;
         }
         let color = sample_anisotropic(mapped, major, mip_level);
-        textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(apply_hue_rotation(color.rgb), color.a));
+        textureStore(output_tex, vec2<i32>(i32(local_x), i32(local_y)), vec4<f32>(apply_hue_rotation(color.rgb, mapped), color.a));
         return;
     }
 
@@ -656,7 +695,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let clamped_position = clamp(mapped, vec2<f32>(0.0), vec2<f32>(f32(settings.source_width) - 1.0, f32(settings.source_height) - 1.0));
         let color = sample_anisotropic(clamped_position, major, mip_level);
-        let final_rgb = apply_hue_rotation(color.rgb);
+        let final_rgb = apply_hue_rotation(color.rgb, clamped_position);
         textureStore(
             output_tex,
             vec2<i32>(i32(local_x), i32(local_y)),
@@ -671,7 +710,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let color = sample_anisotropic(mapped, major, mip_level);
-    let final_rgb = apply_hue_rotation(color.rgb);
+    let final_rgb = apply_hue_rotation(color.rgb, mapped);
 
     textureStore(
         output_tex,

@@ -59,6 +59,8 @@ pub struct KaleidoSettings {
     pub recolor_mode: u8,
     #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_recolor_threshold"))]
     pub recolor_threshold: f32,
+    #[cfg_attr(not(target_arch = "wasm32"), serde(default = "default_recolor_cell_size"))]
+    pub recolor_cell_size: f32,
 
     // ── Enhancements (all default-disabled to preserve existing look/output) ──
     /// Enables bilinear texture filtering when sampling the source image,
@@ -104,6 +106,8 @@ fn default_true() -> bool { true }
 fn default_anisotropy() -> u8 { 1 }
 #[cfg(not(target_arch = "wasm32"))]
 fn default_recolor_threshold() -> f32 { 0.08 }
+#[cfg(not(target_arch = "wasm32"))]
+fn default_recolor_cell_size() -> f32 { 64.0 }
 
 pub struct VideoSettings {
     /// The duration of the animation
