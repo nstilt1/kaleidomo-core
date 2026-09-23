@@ -463,7 +463,7 @@ fn source_in_bounds(src_i: vec2<i32>) -> bool {
 // and `anti_alias` (bilinear) sampling paths share the same hue-rotation code
 // instead of duplicating it.
 fn hash_recolor_cell(cell: vec2<i32>, seed: u32) -> u32 {
-    var h = u32(cell.x) * 0x8da6b343u ^ u32(cell.y) * 0xd8163841u ^ seed;
+    var h = (u32(cell.x) * 0x8da6b343u) ^ (u32(cell.y) * 0xd8163841u) ^ seed;
     h ^= h >> 16u;
     h *= 0x7feb352du;
     h ^= h >> 15u;
