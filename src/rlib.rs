@@ -438,7 +438,7 @@ fn zoom_modulation(video_settings: &VideoSettings, frame: u32) -> f32 {
         video_settings, frame, 
         video_settings.zoom_max, 
         video_settings.zoom_min, 
-        video_settings.num_zoom_loops as f32, 
+        video_settings.num_zoom_loops,
         video_settings.zoom_start_offset, 
         &video_settings.zoom_fn
     )
@@ -945,7 +945,12 @@ pub fn render_video_gpu(
 
         renderer.submit_frame(frame, &submit_settings)?;
 
-        while let Some(done) = renderer.receive_oldest_blocking()? {
+        // Keep multiple frames in flight. Draining the entire queue here made
+        // every frame wait for a GPU readback before the next submission,
+        // which was especially costly on Windows/D3D12.
+        if renderer.pending_len() >= 3 {
+            let done = renderer.receive_oldest_blocking()?
+                .ok_or("GPU video renderer lost a pending frame")?;
             let rgba = renderer.slot_bytes(done.slot_index)?;
             let frame_bytes: std::borrow::Cow<[u8]> = if factor > 1 {
                 std::borrow::Cow::Owned(downsample_box(rgba, render_w, render_h, factor, out_w, out_h))

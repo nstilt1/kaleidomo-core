@@ -1255,6 +1255,10 @@ impl<'a> GpuVideoRenderer<'a> {
         }))
     }
 
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     pub fn slot_bytes(&self, slot_index: usize) -> Result<&[u8], Box<dyn Error>> {
         let slot = self
             .slots

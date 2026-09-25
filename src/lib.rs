@@ -149,7 +149,7 @@ pub struct VideoSettings {
     /// The angle of the zoom at frame 0 in the sawtooth/sin space
     pub zoom_start_offset: f32,
     /// The amount of times that zoom will loop in the video.
-    pub num_zoom_loops: u32,
+    pub num_zoom_loops: f32,
     
     // Audio-reactive export fields
     pub audio_reactive_enabled: bool,
